@@ -333,6 +333,7 @@ class FetchThread(QThread):
         self._temp_error_streak = 0
         self._fatal_error = False
         self._csv_error = False
+        self._fatal_notified = False  # GUI 已對 fatal 彈過提示（停止時據此決定是否補報）
 
         self.time_data = time_data
         self.v_data = v_data
@@ -1161,6 +1162,13 @@ class BT2152App(QMainWindow):
         if exc is not None:
             self.lbl_conn_status.setText("● 未連線")
             self.lbl_conn_status.setStyleSheet("color: #d16a6a; font-weight: bold; padding-left: 10px;")
+            if self.inst is None:
+                # 舊連線已在重建時關閉：舊的 OCV／校準結果不再有效，不可放行後續操作。
+                self.active_channels = []
+                self.btn_cal.setEnabled(False)
+                self.btn_start.setEnabled(False)
+                for row in range(32):
+                    self.table.setItem(row, 1, QTableWidgetItem("X"))
             QMessageBox.critical(self, "連線錯誤", str(exc))
             return
         if created:
@@ -1817,6 +1825,7 @@ class BT2152App(QMainWindow):
     def on_fetch_fatal(self, msg):
         if self._stopping or not self.btn_stop.isEnabled():
             return
+        self.fetch_thread._fatal_notified = True
         log.error("擷取中斷(fatal): %s", msg)
         self.fetch_thread.stop()
         self.fetch_thread.wait()
@@ -1841,6 +1850,8 @@ class BT2152App(QMainWindow):
         csv_file = self.csv_file
         notes = []  # 背景執行緒不能彈窗，警告收集後由 _on_stopped 顯示
 
+        csv_reported = []  # 補抓例外已涵蓋 CSV 失敗時，不再重複補報
+
         def job():  # 背景執行緒：等擷取執行緒結束後才可使用同一個 VISA session
             if ft is not None:
                 ft.wait()
@@ -1859,6 +1870,10 @@ class BT2152App(QMainWindow):
                             notes.append(("停止補抓未完成", "已達 1024 批補抓上限，可能仍有未擷取資料。"))
                     except Exception as e:
                         notes.append(("停止補抓失敗", f"最後資料可能未完整擷取：\n{e}"))
+                        if ft._csv_error: csv_reported.append(True)
+            # 停止期間發生的 CSV fatal 會被 on_fetch_fatal 忽略，在這裡補報。
+            if ft is not None and ft._csv_error and not ft._fatal_notified and not csv_reported:
+                notes.append(("CSV 寫入失敗", "停止前最後一批資料寫入 CSV 失敗，檔案可能不完整。"))
             if self.inst is not None:
                 self._abort_inst(retry_unconfirmed)
 
@@ -1947,8 +1962,12 @@ class BT2152App(QMainWindow):
                 QMessageBox.warning(self, "無法關閉", f"{name} 尚未結束，已保留 CSV 與儀器連線；{detail}")
                 event.ignore()
                 return
-        # 停止（補抓＋ABORt）在背景跑，完成後由 _on_close_stopped 決定是否真的關窗。
+        # 上面的確認對話框跑過巢狀事件迴圈，期間可能已有停止作業（如自動停止）啟動。
         event.ignore()
+        if self._io_busy:
+            QMessageBox.warning(self, "無法關閉", "儀器作業進行中，請稍候再關閉。")
+            return
+        # 停止（補抓＋ABORt）在背景跑，完成後由 _on_close_stopped 決定是否真的關窗。
         self.stop_test(on_done=self._on_close_stopped)
 
     def _on_close_stopped(self, ok):
