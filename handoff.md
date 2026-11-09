@@ -136,6 +136,7 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
 |---|---|---|
 | 1 | `1974e11` | #1 校準中停用/拒絕開始測試；#3 覆寫非空 CSV 先確認；#5 先停再通知；#7 ABORt 失敗警告＋紅燈；A `FetchThread` 改 `threading.Event` 可中斷等待；B/#2 關窗確認、`wait()` 逾時取消關窗；#15 無 VISA backend 仍可用模擬模式；#16 標記容差 0.5×interval；#17 以 `_plotted_channels` 避免重複重建；C 連續擷取失敗只停擷取、**不送 ABORt**，使用者手動停止才送 |
 | 2 | `0f8f132` | #8 CSV 錯誤即 fatal 不重試、先寫 CSV 再進 deque、表頭/關檔失敗處理；#6 停止時 ABORt 前補抓（上限 1024 批）；#11 時長超限直接拒絕；#4 繪圖只畫本輪有擷取的量；#14 溫度點數查詢失敗獨立計數＋警告；#12 位址變更重連；停止中忽略遲到的 fatal；selftest 新增 CSV 部分寫入/flush 失敗案例 |
+| 3 | 見 git log | `/codex-review:code` 整檔複審 4 輪：closeEvent 逾時不再取消 OCV/校準、擷取逾時明示狀態；`stop_test()` 回傳成功/失敗，ABORt 失敗進入 `_inst_unconfirmed`（鎖定 OCV/校準/開始、中斷鈕可重試、不顯示完成），OCV/校準完成回呼不得解除鎖定；通訊 fatal 後使用者手動停止可做一次有界補抓（CSV fatal 仍禁止）；未確認狀態下關窗可選「強制關閉」，重試中斷失敗時重建 session 再 ABORt |
 
 兩批皆通過 `py_compile` 與 offscreen `--selftest`；Opus 另用 MockInstrument 整合腳本驗過關鍵路徑。**尚未真機驗證。**
 
@@ -149,7 +150,12 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
   - #11 偵測「儀器已自停」（不限時長時儀器於 tint×24h 自停，GUI 計時照跑）。
 - **第 4 批**：#13 把連線/啟停/ABORt 的 VISA I/O 移出 GUI 執行緒（工作量大；A 完成後急迫性已降）。
 - **小項**：#2 逾時分支警告文字未提到「擷取已停止」；（已決定）校準重跑失敗會讓「開始測試」保持停用，需再校準成功才能按——接受此行為；`__pycache__` 已加入 `.gitignore` 並移出版控。
-- 做完後可再跑一次 `/codex-review:code` 整檔複審。
+- 第 3 批完成後再跑一次 `/codex-review:code` 整檔複審（上一輪已 APPROVED）。
+- 第 3 輪新增的 UI 流程（強制關閉、重試中斷時重建 session）需在真機上實際走一遍。
+
+### 刻意不修：位址/模式變更只在 OCV 重連（Codex 複審 #4）
+
+`connect_inst()` 只由 `start_ocv()` 呼叫。OCV 完成後改 I/O 位址或模擬模式，再按校準/開始測試仍沿用舊 session。**取捨**：OCV 是必經第一步，之後沿用同一連線是設計使然；要改位址就重跑 OCV。若日後要嚴格化：把 OCV/校準結果綁定連線身分，位址或模式變更時使結果失效並要求重新偵測。
 
 ### 已知殘留限制
 
