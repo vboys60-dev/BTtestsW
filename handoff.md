@@ -4,7 +4,7 @@
 
 Keysight BT2152A/B 電池阻抗/漏電流測試儀控制程式（PyQt5 + pyvisa）。流程：OCV 偵測 → In Situ 校準 → 開始長時間記錄測試，即時繪圖 + 寫 CSV。
 
-無 git。三支獨立檔案（非 import 關係），複製疊代出來的三個階段：
+已有 git（分支 `my-project`）。三支獨立檔案（非 import 關係），複製疊代出來的三個階段：
 
 | 檔案 | 繪圖引擎 | 狀態 |
 |---|---|---|
@@ -121,9 +121,38 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
 
 改動集中在四處，之後動到這些地方要特別小心：
 
-- `FetchThread`：`run()` 拆成 `_fetch_once()` + `_fetch_log()`，**長度驗證一律在寫入 deque 之前**，不符就整批丟棄且不推進 `current_offset`。溫度以 `current_offset` 為單一時間軸基準（`temp_offset` 已移除），缺值補 NaN。單批上限 `8192 // 通道數`。
+- `FetchThread`：`run()` 拆成 `_fetch_once()` + `_fetch_log()`，**長度驗證一律在寫入 deque 之前**，不符就整批丟棄且不推進 `current_offset`；**CSV 先整批寫入並 flush 成功，才 append 進 deque**（2026-11-09 起）。溫度以 `current_offset` 為單一時間軸基準（`temp_offset` 已移除），缺值補 NaN。單批上限 `8192 // 通道數`。
 - `_PollingThread`：`OcvThread` / `InSituThread` 的共同基底，`_wait_available()` 帶取消旗標與逾時，進等待迴圈前先等 `AVAI?` 歸零（沒用 `*OPC?`，理由寫在 docstring）。
 - `start_test()`：CSV 先開才送 `INIT:TEST:MATC`；`<time>` 由總紀錄時間推導；送出後必讀 `SYST:ERR?`。
 - `connect_inst()`：勾選狀態與 `self.inst` 型別不一致就重建連線，但測試進行中不動。
 
 保護參數 `TEST_OVP_V` / `TEST_UVP_V` / `TEST_RES_OHM` / `TEST_CURR_A` / `TEST_OCP_A` 抽成模組常數（原本硬編在指令字串裡），尚未做成 GUI 選項。
+
+## Codex + Opus 審查修正（2026-11-09）
+
+流程：Codex 整檔靜態審查（17 項）→ Opus 對照原始碼複核（13 屬實／4 部分屬實，#2 降 WARNING、#4 降 SUGGESTION，另補 A–D 四項）→ Codex 分批修 → Opus 審查 diff → commit。
+
+| 批次 | commit | 內容 |
+|---|---|---|
+| 1 | `1974e11` | #1 校準中停用/拒絕開始測試；#3 覆寫非空 CSV 先確認；#5 先停再通知；#7 ABORt 失敗警告＋紅燈；A `FetchThread` 改 `threading.Event` 可中斷等待；B/#2 關窗確認、`wait()` 逾時取消關窗；#15 無 VISA backend 仍可用模擬模式；#16 標記容差 0.5×interval；#17 以 `_plotted_channels` 避免重複重建；C 連續擷取失敗只停擷取、**不送 ABORt**，使用者手動停止才送 |
+| 2 | `0f8f132` | #8 CSV 錯誤即 fatal 不重試、先寫 CSV 再進 deque、表頭/關檔失敗處理；#6 停止時 ABORt 前補抓（上限 1024 批）；#11 時長超限直接拒絕；#4 繪圖只畫本輪有擷取的量；#14 溫度點數查詢失敗獨立計數＋警告；#12 位址變更重連；停止中忽略遲到的 fatal；selftest 新增 CSV 部分寫入/flush 失敗案例 |
+
+兩批皆通過 `py_compile` 與 offscreen `--selftest`；Opus 另用 MockInstrument 整合腳本驗過關鍵路徑。**尚未真機驗證。**
+
+### 待辦
+
+- **第 3 批（需真機確認語意）**：
+  - #9 settle 階段可能把上一輪殘留的 `AVAI?`=1 當成功 → 先加 `SYST:ERR?` 檢查，再確認 AVAI 實際行為。
+  - #10 校準結果未驗證（筆數、9.91E37 sentinel、合理範圍）就 `SAVE 1` 並放行測試；電阻上限需依手冊或實測定。
+  - #6 確認 `ABORt` 前後 log 是否仍可讀（目前補抓放在 ABORt 之前）。
+  - C 的策略（fatal 不送 ABORt）建議和真機使用者確認。
+  - #11 偵測「儀器已自停」（不限時長時儀器於 tint×24h 自停，GUI 計時照跑）。
+- **第 4 批**：#13 把連線/啟停/ABORt 的 VISA I/O 移出 GUI 執行緒（工作量大；A 完成後急迫性已降）。
+- **小項**：#2 逾時分支警告文字未提到「擷取已停止」；（已決定）校準重跑失敗會讓「開始測試」保持停用，需再校準成功才能按——接受此行為；`__pycache__` 已加入 `.gitignore` 並移出版控。
+- 做完後可再跑一次 `/codex-review:code` 整檔複審。
+
+### 已知殘留限制
+
+- Event 能中斷輪詢等待，但無法取消進行中的 VISA query（最長 10 秒）。
+- CSV 失敗時檔案可能留有部分批次資料，該批不會進圖表也不會重試。
+- 溫度 query 逾時，遲到的回應可能被下一個 query 讀走，會被 `_fetch_log` 長度驗證擋下並計入 error streak，不污染資料。
