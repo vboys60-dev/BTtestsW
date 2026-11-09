@@ -645,6 +645,24 @@ class MockInstrument:
 # ==========================================
 # 背景執行緒 4：搜尋可用的儀器資源 (VISA)
 # ==========================================
+class _IoTask(QThread):
+    """在背景執行緒跑一段會碰 VISA 的函式（連線／INIT／補抓＋ABORt），避免卡住 GUI。
+    done 以 (結果, 例外) 回報；例外物件原樣帶回，由主執行緒決定怎麼提示。"""
+    done = pyqtSignal(object, object)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            result = self.fn()
+        except Exception as e:
+            self.done.emit(None, e)
+            return
+        self.done.emit(result, None)
+
+
 class ResourceSearchThread(QThread):
     finished_signal = pyqtSignal(bool, str, list)
 
@@ -720,6 +738,11 @@ class BT2152App(QMainWindow):
         self.csv_writer = None
         self._stopping = True  # 停止後維持，直到下一次開始測試。
         self._connected_addr = None
+        # 背景 VISA 作業（_IoTask）進行中旗標；進行中 inst 由該作業獨占，GUI 一律不得碰。
+        self._io_busy = False
+        self._io_task = None
+        self._io_cb = None
+        self._force_close = False
         self.fetched_v = self.fetched_i = self.fetched_temp = False
 
         self.setup_ui()
@@ -1095,42 +1118,58 @@ class BT2152App(QMainWindow):
         if filename:
             self.filepath_input.setText(filename)
 
-    def connect_inst(self):
-        try:
-            want_sim = self.chk_sim_mode.isChecked()
-            address = self.io_addr_input.currentText()
-            if not want_sim and self.rm is None:
-                raise RuntimeError("VISA 資源管理員無法初始化，請確認 VISA 後端；仍可使用模擬模式。")
-            # 連線型別或真機位址改變時重建連線。
-            # 測試進行中（btn_stop 可按）不動連線，避免把 FetchThread 正在用的 session 抽掉。
-            if (self.inst is not None
-                    and (want_sim != isinstance(self.inst, MockInstrument)
-                         or (not want_sim and address != self._connected_addr))
-                    and not self.btn_stop.isEnabled()):
-                try:
-                    self.inst.close()
-                except Exception:
-                    pass
-                self.inst = None
-                self._connected_addr = None
+    def _run_io(self, fn, on_done):
+        """fn 在背景執行緒跑；on_done(result, exc) 回到主執行緒呼叫。fn 內不可碰 Qt widget。"""
+        self._io_busy = True
+        self._io_cb = on_done
+        self._io_task = _IoTask(fn)
+        self._io_task.done.connect(self._on_io_done)  # 綁定方法 → 自動排進主執行緒
+        self._io_task.start()
 
-            if self.inst is None:
-                if want_sim:
-                    self.inst = MockInstrument()
-                else:
-                    self.inst = self.rm.open_resource(address)
-                    self.inst.timeout = 10000
-                    self._connected_addr = address
-                self._inst_unconfirmed = False
-            status_suffix = "（模擬模式）" if isinstance(self.inst, MockInstrument) else ""
-            self.lbl_conn_status.setText(f"● 已連線{status_suffix}")
-            self.lbl_conn_status.setStyleSheet("color: #4db06e; font-weight: bold; padding-left: 10px;")
-            return True
-        except Exception as e:
+    def _on_io_done(self, result, exc):
+        self._io_task.wait()  # done 是 run() 最後一行，等待只是回收執行緒
+        self._io_busy = False
+        cb, self._io_cb = self._io_cb, None
+        cb(result, exc)
+
+    def _connect_blocking(self, want_sim, address, may_rebuild):
+        """背景執行緒：必要時重建連線。回傳是否新建了連線。"""
+        if not want_sim and self.rm is None:
+            raise RuntimeError("VISA 資源管理員無法初始化，請確認 VISA 後端；仍可使用模擬模式。")
+        # 連線型別或真機位址改變時重建連線（測試進行中不動，見 may_rebuild）。
+        if (self.inst is not None and may_rebuild
+                and (want_sim != isinstance(self.inst, MockInstrument)
+                     or (not want_sim and address != self._connected_addr))):
+            try:
+                self.inst.close()
+            except Exception:
+                pass
+            self.inst = None
+            self._connected_addr = None
+        if self.inst is not None:
+            return False
+        if want_sim:
+            self.inst = MockInstrument()
+        else:
+            self.inst = self.rm.open_resource(address)
+            self.inst.timeout = 10000
+            self._connected_addr = address
+        return True
+
+    def _on_connected(self, created, exc, min_v):
+        self.btn_detect.setEnabled(not self._inst_unconfirmed)
+        if exc is not None:
             self.lbl_conn_status.setText("● 未連線")
             self.lbl_conn_status.setStyleSheet("color: #d16a6a; font-weight: bold; padding-left: 10px;")
-            QMessageBox.critical(self, "連線錯誤", str(e))
-            return False
+            QMessageBox.critical(self, "連線錯誤", str(exc))
+            return
+        if created:
+            self._inst_unconfirmed = False
+            self.btn_detect.setEnabled(True)
+        suffix = "（模擬模式）" if isinstance(self.inst, MockInstrument) else ""
+        self.lbl_conn_status.setText(f"● 已連線{suffix}")
+        self.lbl_conn_status.setStyleSheet("color: #4db06e; font-weight: bold; padding-left: 10px;")
+        self._launch_ocv(min_v)
 
     def search_instruments(self):
         self.btn_search.setEnabled(False)
@@ -1230,8 +1269,8 @@ class BT2152App(QMainWindow):
         self.progress_bar.setValue(percent)
         if elapsed >= self.test_duration:
             self.progress_timer.stop()
-            if self.stop_test():
-                QMessageBox.information(self, "測試完成", "已達設定的總紀錄時間，測試自動停止。")
+            self.stop_test(on_done=lambda ok: ok and QMessageBox.information(
+                self, "測試完成", "已達設定的總紀錄時間，測試自動停止。"))
 
     def on_temp_update(self, value):
         """更新外部熱敏電阻溫度即時顯示 (value 為 NaN 代表感測器未接)"""
@@ -1422,14 +1461,23 @@ class BT2152App(QMainWindow):
 
     # --- 1. OCV 偵測 ---
     def start_ocv(self):
-        if not self.connect_inst(): return
+        if self._io_busy: return
         try:
             min_v = float(self.min_ocv_input.text())
             if not (2.8 <= min_v <= 4.3): raise ValueError
         except:
             QMessageBox.warning(self, "警告", "OCV 最低電壓必須介於 2.8V 至 4.3V 之間")
             return
+        want_sim = self.chk_sim_mode.isChecked()
+        address = self.io_addr_input.currentText()
+        may_rebuild = not self.btn_stop.isEnabled()  # 測試進行中不抽掉 FetchThread 的 session
+        self.btn_detect.setEnabled(False)
+        self.lbl_conn_status.setText("● 連線中…")
+        self.lbl_conn_status.setStyleSheet("color: #d1a04a; font-weight: bold; padding-left: 10px;")
+        self._run_io(lambda: self._connect_blocking(want_sim, address, may_rebuild),
+                     lambda created, exc: self._on_connected(created, exc, min_v))
 
+    def _launch_ocv(self, min_v):
         self.btn_detect.setEnabled(False)
         self.btn_cal.setEnabled(False)
         self.btn_start.setEnabled(False)
@@ -1473,6 +1521,7 @@ class BT2152App(QMainWindow):
 
     # --- 2. In Situ 校準 ---
     def start_in_situ(self):
+        if self._io_busy: return
         self.btn_detect.setEnabled(False)
         self.btn_cal.setEnabled(False)
         self.btn_start.setEnabled(False)
@@ -1509,6 +1558,7 @@ class BT2152App(QMainWindow):
 
     # --- 3. 開始測試 ---
     def start_test(self):
+        if self._io_busy: return
         if hasattr(self, 'insitu_thread') and self.insitu_thread.isRunning():
             QMessageBox.warning(self, "警告", "校準仍在執行中，請等校準結束後再開始測試。")
             return
@@ -1625,20 +1675,26 @@ class BT2152App(QMainWindow):
             return
 
         active_str = ",".join(map(str, self.active_channels))
-        try:
-            self.inst.write(
-                f"INIT:TEST:MATC {test_minutes}, {TEST_OVP_V}, {TEST_UVP_V}, {TEST_RES_OHM}, "
-                f"{interval}, {TEST_CURR_A}, {TEST_OCP_A}, (@{active_str})"
-            )
+        cmd = (f"INIT:TEST:MATC {test_minutes}, {TEST_OVP_V}, {TEST_UVP_V}, {TEST_RES_OHM}, "
+               f"{interval}, {TEST_CURR_A}, {TEST_OCP_A}, (@{active_str})")
+        inst = self.inst
+
+        def job():  # 背景執行緒
+            inst.write(cmd)
             # write() 對被拒絕的指令不會拋例外，只會進 error queue，所以必須主動讀回來
-            err = self.inst.query("SYST:ERR?").strip()
+            err = inst.query("SYST:ERR?").strip()
             if not err.lstrip('+').startswith("0"):
                 raise RuntimeError(f"儀器拒絕測試指令：{err}")
-        except Exception as e:
-            QMessageBox.critical(self, "啟動失敗", str(e))
+
+        self.btn_stop.setEnabled(False)  # INIT 送出期間不可中斷；成功後才開放
+        self._run_io(job, lambda r, e: self._on_test_started(e, interval, filepath, fetch_temp))
+
+    def _on_test_started(self, exc, interval, filepath, fetch_temp):
+        if exc is not None:
+            QMessageBox.critical(self, "啟動失敗", str(exc))
             self.stop_test()
             return
-
+        self.btn_stop.setEnabled(True)
         self.fetch_thread = FetchThread(
             self.inst, self.active_channels, interval,
             self.fetched_v, self.fetched_i, fetch_temp,
@@ -1771,86 +1827,105 @@ class BT2152App(QMainWindow):
         self.lbl_conn_status.setStyleSheet("color: #d16a6a; font-weight: bold; padding-left: 10px;")
         QMessageBox.warning(self, "擷取中斷", msg + "\n儀器仍在內部記錄；如需停止，請按「中斷測試」或手動處理儀器。")
 
-    def stop_test(self, manual=False):
+    def stop_test(self, manual=False, on_done=None):
+        """非同步停止；完成後呼叫 on_done(ok)。ok=False 代表 ABORt 失敗、儀器狀態未確認。"""
+        if self._io_busy: return
         log.info("停止測試 manual=%s unconfirmed=%s", manual, self._inst_unconfirmed)
         retry_unconfirmed = manual and self._inst_unconfirmed
         self._stopping = True
         self.progress_timer.stop()
+        self.btn_stop.setEnabled(False)  # 停止作業進行中不重入；結果出來後 _on_stopped 再決定
+        ft = getattr(self, 'fetch_thread', None)
+        if ft is not None:
+            ft.stop()
+        csv_file = self.csv_file
+        notes = []  # 背景執行緒不能彈窗，警告收集後由 _on_stopped 顯示
 
-        if hasattr(self, 'fetch_thread'):
-            self.fetch_thread.stop()
-            self.fetch_thread.wait()
-            # wait 後才可從 UI 執行緒使用同一個 VISA session；必須在 ABORt 前補抓。
-            # 檔案身分避免啟動失敗時誤用上一輪的 fetch_thread。
-            if (self.csv_file is not None
-                    and self.fetch_thread.csv_file is self.csv_file
-                    and (manual or not self.fetch_thread._fatal_error)
-                    and not self.fetch_thread._csv_error):
-                try:
-                    for _ in range(1024):
-                        # 僅明確手動停止可越過通訊 fatal；不重設 fatal、不重啟背景擷取。
-                        # 任一例外即離開補抓，仍繼續送 ABORt；CSV fatal 永遠不可補抓。
-                        if not self.fetch_thread._fetch_once(allow_comm_fatal=manual):
-                            if self.fetch_thread._csv_error:
-                                raise OSError("CSV 寫入失敗，補抓資料可能未完整儲存。")
-                            break
-                    else:
-                        QMessageBox.warning(self, "停止補抓未完成", "已達 1024 批補抓上限，可能仍有未擷取資料。")
-                except Exception as e:
-                    QMessageBox.warning(self, "停止補抓失敗", f"最後資料可能未完整擷取：\n{e}")
-
-        if self.inst is not None:
-            try:
-                try:
-                    self.inst.write("ABORt")
-                except Exception:
-                    if not retry_unconfirmed:
-                        raise
-                    # 僅未確認狀態的手動重試可重建；此時擷取執行緒已停止。
-                    # 沿用原 session 的模式／記錄位址，不採用 UI 中途變更的設定。
-                    want_sim = isinstance(self.inst, MockInstrument)
+        def job():  # 背景執行緒：等擷取執行緒結束後才可使用同一個 VISA session
+            if ft is not None:
+                ft.wait()
+                # 補抓必須在 ABORt 前；檔案身分避免啟動失敗時誤用上一輪的 fetch_thread。
+                if (csv_file is not None and ft.csv_file is csv_file
+                        and (manual or not ft._fatal_error) and not ft._csv_error):
                     try:
-                        self.inst.close()
-                    except Exception:
-                        pass
-                    try:
-                        if want_sim:
-                            self.inst = MockInstrument()
+                        for _ in range(1024):
+                            # 僅明確手動停止可越過通訊 fatal；不重設 fatal、不重啟背景擷取。
+                            # 任一例外即離開補抓，仍繼續送 ABORt；CSV fatal 永遠不可補抓。
+                            if not ft._fetch_once(allow_comm_fatal=manual):
+                                if ft._csv_error:
+                                    raise OSError("CSV 寫入失敗，補抓資料可能未完整儲存。")
+                                break
                         else:
-                            if self.rm is None or not self._connected_addr:
-                                raise RuntimeError("缺少 VISA 資源管理員或原連線位址。")
-                            self.inst = self.rm.open_resource(self._connected_addr)
-                            self.inst.timeout = 10000
-                        self.inst.write("ABORt")
+                            notes.append(("停止補抓未完成", "已達 1024 批補抓上限，可能仍有未擷取資料。"))
                     except Exception as e:
-                        raise RuntimeError(f"重新連線或再次中斷失敗：{e}") from e
-                self._inst_unconfirmed = False
-                if retry_unconfirmed:
-                    suffix = "（模擬模式）" if isinstance(self.inst, MockInstrument) else ""
-                    self.lbl_conn_status.setText(f"● 已連線{suffix}")
-                    self.lbl_conn_status.setStyleSheet("color: #4db06e; font-weight: bold; padding-left: 10px;")
+                        notes.append(("停止補抓失敗", f"最後資料可能未完整擷取：\n{e}"))
+            if self.inst is not None:
+                self._abort_inst(retry_unconfirmed)
+
+        self._run_io(job, lambda r, e: self._on_stopped(e, notes, retry_unconfirmed, on_done))
+
+    def _abort_inst(self, retry_unconfirmed):
+        """背景執行緒：送 ABORt；失敗則丟例外。"""
+        try:
+            self.inst.write("ABORt")
+        except Exception:
+            if not retry_unconfirmed:
+                raise
+            # 僅未確認狀態的手動重試可重建；此時擷取執行緒已停止。
+            # 沿用原 session 的模式／記錄位址，不採用 UI 中途變更的設定。
+            want_sim = isinstance(self.inst, MockInstrument)
+            try:
+                self.inst.close()
+            except Exception:
+                pass
+            try:
+                if want_sim:
+                    self.inst = MockInstrument()
+                else:
+                    if self.rm is None or not self._connected_addr:
+                        raise RuntimeError("缺少 VISA 資源管理員或原連線位址。")
+                    self.inst = self.rm.open_resource(self._connected_addr)
+                    self.inst.timeout = 10000
+                self.inst.write("ABORt")
             except Exception as e:
-                log.exception("ABORt 失敗，儀器狀態未確認")
-                self._inst_unconfirmed = True
-                self._close_csv_file()
-                self.btn_detect.setEnabled(False)
-                self.btn_cal.setEnabled(False)
-                self.btn_start.setEnabled(False)
-                self.btn_stop.setEnabled(True)
-                self.lbl_conn_status.setText("● 儀器狀態未確認")
-                self.lbl_conn_status.setStyleSheet("color: #d16a6a; font-weight: bold; padding-left: 10px;")
-                QMessageBox.warning(self, "中斷失敗", f"ABORt 傳送失敗，儀器狀態未確認；擷取已停止、CSV 已關閉。請重按「中斷測試」重試或手動處理儀器：\n{e}")
-                return False
+                raise RuntimeError(f"重新連線或再次中斷失敗：{e}") from e
 
+    def _on_stopped(self, exc, notes, retry_unconfirmed, on_done):
+        for title, text in notes:
+            QMessageBox.warning(self, title, text)
+        if exc is not None:
+            log.error("ABORt 失敗，儀器狀態未確認", exc_info=exc)
+            self._inst_unconfirmed = True
+            self._close_csv_file()
+            self.btn_detect.setEnabled(False)
+            self.btn_cal.setEnabled(False)
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+            self.lbl_conn_status.setText("● 儀器狀態未確認")
+            self.lbl_conn_status.setStyleSheet("color: #d16a6a; font-weight: bold; padding-left: 10px;")
+            QMessageBox.warning(self, "中斷失敗", f"ABORt 傳送失敗，儀器狀態未確認；擷取已停止、CSV 已關閉。請重按「中斷測試」重試或手動處理儀器：\n{exc}")
+            if on_done: on_done(False)
+            return
+        self._inst_unconfirmed = False
+        if retry_unconfirmed:
+            suffix = "（模擬模式）" if isinstance(self.inst, MockInstrument) else ""
+            self.lbl_conn_status.setText(f"● 已連線{suffix}")
+            self.lbl_conn_status.setStyleSheet("color: #4db06e; font-weight: bold; padding-left: 10px;")
         self._close_csv_file()
-
-        self.btn_detect.setEnabled(not self._inst_unconfirmed)
-        if self.active_channels: self.btn_cal.setEnabled(not self._inst_unconfirmed)
-        if self.active_channels: self.btn_start.setEnabled(not self._inst_unconfirmed)
-        self.btn_stop.setEnabled(self._inst_unconfirmed)
-        return not self._inst_unconfirmed
+        self.btn_detect.setEnabled(True)
+        if self.active_channels: self.btn_cal.setEnabled(True)
+        if self.active_channels: self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        if on_done: on_done(True)
 
     def closeEvent(self, event):
+        if self._force_close:
+            event.accept()
+            return
+        if self._io_busy:
+            QMessageBox.warning(self, "無法關閉", "儀器作業進行中，請稍候再關閉。")
+            event.ignore()
+            return
         if self.btn_stop.isEnabled():
             if QMessageBox.question(
                     self, "確認關閉", "測試仍在進行中，是否中斷測試並關閉？",
@@ -1872,30 +1947,25 @@ class BT2152App(QMainWindow):
                 QMessageBox.warning(self, "無法關閉", f"{name} 尚未結束，已保留 CSV 與儀器連線；{detail}")
                 event.ignore()
                 return
-        if not self.stop_test():
+        # 停止（補抓＋ABORt）在背景跑，完成後由 _on_close_stopped 決定是否真的關窗。
+        event.ignore()
+        self.stop_test(on_done=self._on_close_stopped)
+
+    def _on_close_stopped(self, ok):
+        if not ok:
             if QMessageBox.question(
                     self, "確認強制關閉", "儀器狀態未確認，仍要強制關閉？",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
-                event.ignore()
                 return
-            # 強制關閉時各自盡力清理，任一清理失敗都不再阻擋離開。
-            try:
-                self._close_csv_file(warn=False)
-            except Exception:
-                pass
-            try:
-                if self.inst is not None:
-                    self.inst.close()
-            except Exception:
-                pass
-            event.accept()
-            return
+            self._close_csv_file(warn=False)
         if self.inst is not None:
             try:
                 self.inst.close()
             except Exception as e:
-                QMessageBox.warning(self, "關閉連線失敗", str(e))
-        event.accept()
+                if ok:
+                    QMessageBox.warning(self, "關閉連線失敗", str(e))
+        self._force_close = True
+        self.close()
 
 def _selftest_fetch_alignment():
     """FetchThread 取樣管線的不變式檢查，執行方式：

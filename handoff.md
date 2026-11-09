@@ -148,7 +148,7 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
   - #6 確認 `ABORt` 前後 log 是否仍可讀（目前補抓放在 ABORt 之前）。
   - C 的策略（fatal 不送 ABORt）建議和真機使用者確認。
   - #11 偵測「儀器已自停」（不限時長時儀器於 tint×24h 自停，GUI 計時照跑）。
-- **第 4 批**：#13 把連線/啟停/ABORt 的 VISA I/O 移出 GUI 執行緒（工作量大；A 完成後急迫性已降）。
+- **第 4 批（#13 已完成，未 commit、未真機驗證）**：連線／`INIT:TEST:MATC`＋`SYST:ERR?`／停止（等擷取執行緒＋補抓＋ABORt＋重建 session）全改由 `_IoTask`（QThread）執行，`_run_io(fn, on_done)` 派工、`_io_busy` 旗標防重入（忙碌中 `start_ocv/start_in_situ/start_test/stop_test` 直接 return，`closeEvent` 提示稍後再關）。`stop_test(manual, on_done)` 改非同步，結果以 `on_done(ok)` 回報；`closeEvent` 改為 ignore → 停止完成後 `_on_close_stopped` 再 `close()`。**規則**：`_run_io` 的 fn 在背景跑，不可碰 widget／彈窗（警告收集成 notes 由主執行緒顯示），且作業期間 `self.inst` 由該作業獨占。殘留：`closeEvent` 內 `thread.wait(5000)` 與最後的 `inst.close()` 仍在 GUI 執行緒。
 - **小項**：（#2 逾時警告文字已於第 3 批處理）（已決定）校準重跑失敗會讓「開始測試」保持停用，需再校準成功才能按——接受此行為；`__pycache__` 已加入 `.gitignore` 並移出版控。
 - 第 3 批完成後再跑一次 `/codex-review:code` 整檔複審（上一輪已 APPROVED）。
 - 第 3 輪新增的 UI 流程（強制關閉、重試中斷時重建 session）需在真機上實際走一遍。
