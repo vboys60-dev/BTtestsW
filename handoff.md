@@ -148,10 +148,13 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
   - #6 確認 `ABORt` 前後 log 是否仍可讀（目前補抓放在 ABORt 之前）。
   - C 的策略（fatal 不送 ABORt）建議和真機使用者確認。
   - #11 偵測「儀器已自停」（不限時長時儀器於 tint×24h 自停，GUI 計時照跑）。
-- **第 4 批（#13 已完成，未 commit、未真機驗證）**：連線／`INIT:TEST:MATC`＋`SYST:ERR?`／停止（等擷取執行緒＋補抓＋ABORt＋重建 session）全改由 `_IoTask`（QThread）執行，`_run_io(fn, on_done)` 派工、`_io_busy` 旗標防重入（忙碌中 `start_ocv/start_in_situ/start_test/stop_test` 直接 return，`closeEvent` 提示稍後再關）。`stop_test(manual, on_done)` 改非同步，結果以 `on_done(ok)` 回報；`closeEvent` 改為 ignore → 停止完成後 `_on_close_stopped` 再 `close()`。**規則**：`_run_io` 的 fn 在背景跑，不可碰 widget／彈窗（警告收集成 notes 由主執行緒顯示），且作業期間 `self.inst` 由該作業獨占。殘留：`closeEvent` 內 `thread.wait(5000)` 與最後的 `inst.close()` 仍在 GUI 執行緒。
+- **第 4 批（#13 已完成，`c3edb99`＋`83d5549`，未真機驗證）**：連線／`INIT:TEST:MATC`＋`SYST:ERR?`／停止（等擷取執行緒＋補抓＋ABORt＋重建 session）全改由 `_IoTask`（QThread）執行，`_run_io(fn, on_done)` 派工、`_io_busy` 旗標防重入（忙碌中 `start_ocv/start_in_situ/start_test/stop_test` 直接 return，`closeEvent` 提示稍後再關）。`stop_test(manual, on_done)` 改非同步，結果以 `on_done(ok)` 回報；`closeEvent` 改為 ignore → 停止完成後 `_on_close_stopped` 再 `close()`。**規則**：`_run_io` 的 fn 在背景跑，不可碰 widget／彈窗（警告收集成 notes 由主執行緒顯示），且作業期間 `self.inst` 由該作業獨占。殘留：`closeEvent` 內 `thread.wait(5000)` 與最後的 `inst.close()` 仍在 GUI 執行緒。
+  - **Codex 整檔複審（2026-11-09，4 輪，最終 APPROVED）**：已修三項——連線重建失敗且 `inst` 為 None 時清空 `active_channels`、停用校準/開始、表格設 X；停止期間發生的 CSV fatal 會被 `on_fetch_fatal` 忽略，改由 `stop_test` 的 job 在 `wait()` 後補報（`FetchThread._fatal_notified` 記錄 GUI 是否已提示，補抓例外已涵蓋時不重複）；`closeEvent` 確認對話框（巢狀事件迴圈）之後再檢查 `_io_busy`。
+  - **複審中提出但刻意不修**：settle 階段殘留 `AVAI?`=1（即 #9）、校準結果未驗證就 `SAVE 1`（即 #10）——兩者仍待真機；`closeEvent` 的 `wait`／`inst.close()` 阻塞 GUI（已知殘留）；追平積欠資料時每批都發更新訊號、重複重繪（等實際卡頓再做 dirty flag＋固定頻率重繪）。
+  - 驗證腳本（模擬模式 headless，連線→OCV→校準→測試→停止→ABORt 失敗重試→關窗）寫在暫存目錄未留專案內，需要時照 `_run_io` 的非同步流程用 `processEvents` 輪詢重寫。
 - **小項**：（#2 逾時警告文字已於第 3 批處理）（已決定）校準重跑失敗會讓「開始測試」保持停用，需再校準成功才能按——接受此行為；`__pycache__` 已加入 `.gitignore` 並移出版控。
-- 第 3 批完成後再跑一次 `/codex-review:code` 整檔複審（上一輪已 APPROVED）。
-- 第 3 輪新增的 UI 流程（強制關閉、重試中斷時重建 session）需在真機上實際走一遍。
+- 第 3 批（真機語意項）完成後再跑一次 `/codex-review:code` 整檔複審（#13 後的複審已 APPROVED）。
+- 第 3 輪新增的 UI 流程（強制關閉、重試中斷時重建 session）與 #13 的非同步連線／啟停流程，需在真機上實際走一遍。
 ### 刻意不修：位址/模式變更只在 OCV 重連（Codex 複審 #4）
 
 `connect_inst()` 只由 `start_ocv()` 呼叫。OCV 完成後改 I/O 位址或模擬模式，再按校準/開始測試仍沿用舊 session。**取捨**：OCV 是必經第一步，之後沿用同一連線是設計使然；要改位址就重跑 OCV。若日後要嚴格化：把 OCV/校準結果綁定連線身分，位址或模式變更時使結果失效並要求重新偵測。
