@@ -292,6 +292,7 @@ class FetchThread(QThread):
         self.csv_file = csv_file
         self.data_lock = data_lock
         self.is_running = True
+        self._stop_event = threading.Event()
         self.current_offset = 0
         self._error_streak = 0
 
@@ -419,10 +420,11 @@ class FetchThread(QThread):
                     return
 
             if not progressed:
-                time.sleep(sleep_time)
+                self._stop_event.wait(sleep_time)
 
     def stop(self):
         self.is_running = False
+        self._stop_event.set()
 
 # ==========================================
 # 模擬儀器：不需要真實 BT2152A/B 與 VISA 連線，供介面驗證/展示使用
@@ -609,7 +611,10 @@ class BT2152App(QMainWindow):
         self.resize(1300, 850)
         self.setStyleSheet(DARK_QSS)
 
-        self.rm = pyvisa.ResourceManager()
+        try:
+            self.rm = pyvisa.ResourceManager()
+        except Exception:
+            self.rm = None
         self.inst = None
         self.active_channels = []
 
@@ -630,6 +635,7 @@ class BT2152App(QMainWindow):
         self.data_lock = threading.Lock() # 保護 FetchThread 寫入與主執行緒繪圖讀取之間的資料一致性
         self.lines_v = {}  # 通道 -> 電壓 Line2D，供增量更新繪圖
         self.lines_i = {}  # 通道 -> 電流 Line2D，供增量更新繪圖
+        self._plotted_channels = set()
         self.line_temp = None  # 外部溫度 Line2D，供增量更新繪圖
 
         self.hover_line_a = None  # 圖A 游標對照線 (setup_ui 中建立)
@@ -708,6 +714,7 @@ class BT2152App(QMainWindow):
         grid.addWidget(self.chk_sim_mode, 2, 0, 1, 2)
 
         self.btn_search = QPushButton("搜尋儀器")
+        self.btn_search.setEnabled(self.rm is not None)
         self.btn_search.clicked.connect(self.search_instruments)
         grid.addWidget(self.btn_search, 2, 2)
 
@@ -1025,6 +1032,8 @@ class BT2152App(QMainWindow):
     def connect_inst(self):
         try:
             want_sim = self.chk_sim_mode.isChecked()
+            if not want_sim and self.rm is None:
+                raise RuntimeError("VISA 資源管理員無法初始化，請確認 VISA 後端；仍可使用模擬模式。")
             # 勾選狀態與現有連線型別不一致就重建，否則模擬→真機切換要重啟程式才生效。
             # 測試進行中（btn_stop 可按）不動連線，避免把 FetchThread 正在用的 session 抽掉。
             if (self.inst is not None
@@ -1150,8 +1159,8 @@ class BT2152App(QMainWindow):
         self.progress_bar.setValue(percent)
         if elapsed >= self.test_duration:
             self.progress_timer.stop()
-            QMessageBox.information(self, "測試完成", "已達設定的總紀錄時間，測試自動停止。")
             self.stop_test()
+            QMessageBox.information(self, "測試完成", "已達設定的總紀錄時間，測試自動停止。")
 
     def on_temp_update(self, value):
         """更新外部熱敏電阻溫度即時顯示 (value 為 NaN 代表感測器未接)"""
@@ -1317,7 +1326,7 @@ class BT2152App(QMainWindow):
             i_snapshot = {ch: list(self.i_data[ch]) for ch in self.active_channels}
 
         target_channels = [ch for ch in self.active_channels if self.channel_display.get(ch, True)]
-        max_gap = self.current_interval * 1.5
+        max_gap = self.current_interval * 0.5
         blocks = []
         for m in self.pinned_markers:
             idx = self._nearest_index(times, m['time'], max_gap=max_gap)
@@ -1395,6 +1404,7 @@ class BT2152App(QMainWindow):
     def start_in_situ(self):
         self.btn_detect.setEnabled(False)
         self.btn_cal.setEnabled(False)
+        self.btn_start.setEnabled(False)
         
         for ch in self.active_channels:
             self.table.setItem(ch-1, 3, QTableWidgetItem("校準中.."))
@@ -1428,10 +1438,18 @@ class BT2152App(QMainWindow):
 
     # --- 3. 開始測試 ---
     def start_test(self):
+        if hasattr(self, 'insitu_thread') and self.insitu_thread.isRunning():
+            QMessageBox.warning(self, "警告", "校準仍在執行中，請等校準結束後再開始測試。")
+            return
         filepath = self.filepath_input.text()
         if not filepath:
             QMessageBox.warning(self, "警告", "請先設定 CSV 檔案儲存路徑")
             return
+        if os.path.isfile(filepath) and os.path.getsize(filepath) > 0:
+            if QMessageBox.question(
+                    self, "確認覆寫", f"CSV 檔案已有資料，是否覆寫？\n{filepath}",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
             
         try:
             interval = int(self.interval_input.text())
@@ -1484,6 +1502,7 @@ class BT2152App(QMainWindow):
 
         self.lines_v = {}
         self.lines_i = {}
+        self._plotted_channels = None  # 下一次更新必須重建曲線
         self.line_temp = None
         self.lbl_temp_value.setText("外部溫度: N/A")
         self.current_interval = interval
@@ -1575,8 +1594,7 @@ class BT2152App(QMainWindow):
         # 只繪製「已啟用 且 使用者勾選要顯示於圖表」的通道；不影響資料記錄/CSV (仍以 active_channels 為準)
         target_channels = [ch for ch in self.active_channels if self.channel_display.get(ch, True)]
 
-        existing_line_channels = set(self.lines_v.keys()) | set(self.lines_i.keys())
-        channels_changed = existing_line_channels != set(target_channels)
+        channels_changed = self._plotted_channels != set(target_channels)
         temp_line_mismatch = show_temp != (self.line_temp is not None)
         need_full_rebuild = force_redraw or channels_changed or temp_line_mismatch
 
@@ -1628,6 +1646,7 @@ class BT2152App(QMainWindow):
                 self.plot_item_b.addItem(m['line_b'], ignoreBounds=True)
 
             self._render_marker_panel()
+            self._plotted_channels = set(target_channels)
         else:
             # 增量更新：只更新既有線條的資料
             for ch in target_channels:
@@ -1657,10 +1676,14 @@ class BT2152App(QMainWindow):
 
     def on_fetch_fatal(self, msg):
         print(msg)
-        self.stop_test()
+        self.fetch_thread.stop()
+        self.fetch_thread.wait()
+        # 儀器仍在內部記錄，停用自動停止，保留手動中斷按鈕。
+        self.progress_timer.stop()
+        self.test_start_time = None
         self.lbl_conn_status.setText("● 擷取中斷")
         self.lbl_conn_status.setStyleSheet("color: #d16a6a; font-weight: bold; padding-left: 10px;")
-        QMessageBox.critical(self, "擷取中斷", msg)
+        QMessageBox.warning(self, "擷取中斷", msg + "\n儀器仍在內部記錄；如需停止，請按「中斷測試」或手動處理儀器。")
 
     def stop_test(self):
         self.progress_timer.stop()
@@ -1669,10 +1692,13 @@ class BT2152App(QMainWindow):
             self.fetch_thread.stop()
             self.fetch_thread.wait()
 
-        try:
-            self.inst.write("ABORt")
-        except:
-            pass
+        if self.inst is not None:
+            try:
+                self.inst.write("ABORt")
+            except Exception as e:
+                self.lbl_conn_status.setText("● 中斷指令失敗")
+                self.lbl_conn_status.setStyleSheet("color: #d16a6a; font-weight: bold; padding-left: 10px;")
+                QMessageBox.warning(self, "中斷失敗", f"ABORt 傳送失敗，請確認儀器狀態：\n{e}")
 
         self._close_csv_file()
 
@@ -1682,6 +1708,12 @@ class BT2152App(QMainWindow):
         self.btn_stop.setEnabled(False)
 
     def closeEvent(self, event):
+        if self.btn_stop.isEnabled():
+            if QMessageBox.question(
+                    self, "確認關閉", "測試仍在進行中，是否中斷測試並關閉？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                event.ignore()
+                return
         self.progress_timer.stop()
         # 四個背景執行緒都要收乾淨，否則關窗時會出現 QThread: Destroyed while thread is still running
         for name in ('fetch_thread', 'ocv_thread', 'insitu_thread', 'search_thread'):
@@ -1690,13 +1722,16 @@ class BT2152App(QMainWindow):
                 continue
             if hasattr(thread, 'stop'):
                 thread.stop()
-            # search_thread 卡在 VISA list_resources 時無法取消，等不到就放手讓程式收掉
-            thread.wait(5000)
-        self._close_csv_file()
-        if self.inst:
-            try: self.inst.write("ABORt")
-            except: pass
-            self.inst.close()
+            if not thread.wait(5000):
+                QMessageBox.warning(self, "無法關閉", f"{name} 尚未結束，已保留 CSV 與儀器連線；請稍後重試關閉或手動停止測試。")
+                event.ignore()
+                return
+        self.stop_test()
+        if self.inst is not None:
+            try:
+                self.inst.close()
+            except Exception as e:
+                QMessageBox.warning(self, "關閉連線失敗", str(e))
         event.accept()
 
 def _selftest_fetch_alignment():
