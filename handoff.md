@@ -152,7 +152,6 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
 - **小項**：#2 逾時分支警告文字未提到「擷取已停止」；（已決定）校準重跑失敗會讓「開始測試」保持停用，需再校準成功才能按——接受此行為；`__pycache__` 已加入 `.gitignore` 並移出版控。
 - 第 3 批完成後再跑一次 `/codex-review:code` 整檔複審（上一輪已 APPROVED）。
 - 第 3 輪新增的 UI 流程（強制關閉、重試中斷時重建 session）需在真機上實際走一遍。
-
 ### 刻意不修：位址/模式變更只在 OCV 重連（Codex 複審 #4）
 
 `connect_inst()` 只由 `start_ocv()` 呼叫。OCV 完成後改 I/O 位址或模擬模式，再按校準/開始測試仍沿用舊 session。**取捨**：OCV 是必經第一步，之後沿用同一連線是設計使然；要改位址就重跑 OCV。若日後要嚴格化：把 OCV/校準結果綁定連線身分，位址或模式變更時使結果失效並要求重新偵測。
@@ -162,3 +161,13 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
 - Event 能中斷輪詢等待，但無法取消進行中的 VISA query（最長 10 秒）。
 - CSV 失敗時檔案可能留有部分批次資料，該批不會進圖表也不會重試。
 - 溫度 query 逾時，遲到的回應可能被下一個 query 讀走，會被 `_fetch_log` 長度驗證擋下並計入 error streak，不污染資料。
+
+## 錯誤日誌（除錯用）
+
+- **位置**：`logs/bt2152.log`（專案目錄下，已加入 `.gitignore`）。1 MB × 5 份輪替，總量上限約 6 MB。日誌目錄不可寫時退回 stderr（Terminal 視窗）。
+- **何時寫入**：只有正式啟動（`python3 BT2152_v3_pyqtgraph.py` / `啟動BT2152.command`）；`--selftest` 不寫。
+- **記什麼**：啟動時的 Python/pyvisa/pyqtgraph 版本；擷取錯誤（WARNING）、擷取中斷 fatal（ERROR）、`ABORt` 失敗含堆疊、測試開始/停止（INFO）；以及所有未處理例外（CRITICAL，含 slot、QTimer、`QThread.run` 內的）。每行格式帶時間與 `[執行緒名稱]`。
+- **實作**：`_setup_logging()`，模組 logger 為 `log`。PyQt5 的 slot/QTimer/QThread 例外一律走 `sys.excepthook`，**不是** `threading.excepthook`（對 QThread 無效，已實測），所以只掛前者。掛上後未處理例外不再讓程式 abort，而是繼續跑——`FetchThread` 若意外死掉，GUI 可能仍顯示「測試中」，請看日誌。
+- **加新紀錄點**：直接 `log.info/warning/exception(...)`，參數用 `%s` 佔位符傳入。不要在輪詢迴圈逐筆記 SCPI 指令，會灌爆日誌。
+- **注意**：日誌含完整 CSV 路徑與 VISA 錯誤字串（可能有使用者名稱、儀器位址）；外傳前先檢查。
+- **未做**：`--debug`/DEBUG 等級（目前沒有 `log.debug` 呼叫）、持續錯誤節流（首次/每 N 次/恢復）、GUI「開啟日誌資料夾」按鈕。

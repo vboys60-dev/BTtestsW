@@ -8,6 +8,8 @@ Created on Wed Mar 25 15:42:48 2026
 
 import sys
 import os
+import logging
+import logging.handlers
 
 # pyqtgraph 若偵測到系統同時裝有多套 Qt binding (PyQt5/PyQt6/PySide6...)，
 # 預設可能選到跟本程式（PyQt5）不同的一套，導致 QApplication 不匹配而崩潰。
@@ -32,6 +34,39 @@ from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPointF, QTimer
 from PyQt5.QtGui import QColor
 
 import pyqtgraph as pg
+
+log = logging.getLogger("bt2152")
+
+
+def _setup_logging():
+    """背景錯誤記錄器：寫到 logs/bt2152.log（1MB x 5 份輪替）。
+
+    PyQt5 的 slot、QTimer 與 QThread.run 內的未處理例外都會交給 sys.excepthook
+    （不是 threading.excepthook），掛上它即可把例外寫進日誌；長時間無人看管的測試，
+    出錯時這份檔案是唯一線索。
+    """
+    if log.handlers:
+        return
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    try:
+        os.makedirs(d, exist_ok=True)
+        h = logging.handlers.RotatingFileHandler(
+            os.path.join(d, "bt2152.log"), maxBytes=1_000_000, backupCount=5, encoding="utf-8")
+    except OSError:
+        h = logging.StreamHandler()      # 日誌目錄不可寫時退回 stderr，不讓程式起不來
+        log.warning("日誌目錄不可寫，改輸出到 stderr")
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+    log.info("=== 啟動 python=%s pyvisa=%s pyqtgraph=%s ===",
+             sys.version.split()[0], pyvisa.__version__, pg.__version__)
+
+    def _sys_hook(t, v, tb):
+        log.critical("未處理例外", exc_info=(t, v, tb))   # 執行緒名稱在日誌格式裡
+        sys.__excepthook__(t, v, tb)
+
+    sys.excepthook = _sys_hook
+
 
 # 標記線色盤（最多同時釘選 2 條，依序指派不同顏色）
 MARKER_COLORS = ['#e63946', '#2a9d8f']
@@ -1615,6 +1650,7 @@ class BT2152App(QMainWindow):
         self.fetch_thread.fatal_signal.connect(self.on_fetch_fatal)
         self.fetch_thread.temp_signal.connect(self.on_temp_update)
         self.fetch_thread.start()
+        log.info("測試開始 通道數=%d csv=%s", len(self.active_channels), filepath)
 
         self.test_start_time = time.time()
         self.progress_bar.setValue(0)
@@ -1718,15 +1754,14 @@ class BT2152App(QMainWindow):
                     QMessageBox.warning(self, "CSV 關閉失敗", f"資料可能未完整儲存：\n{e}")
 
     def on_fetch_error(self, msg):
-        # 原本只 print 到 stdout，用 .command 啟動時根本沒人看得到
-        print(msg)
+        log.warning("擷取錯誤: %s", msg)
         self.lbl_conn_status.setText(f"● {msg}")
         self.lbl_conn_status.setStyleSheet("color: #d1a04a; font-weight: bold; padding-left: 10px;")
 
     def on_fetch_fatal(self, msg):
         if self._stopping or not self.btn_stop.isEnabled():
             return
-        print(msg)
+        log.error("擷取中斷(fatal): %s", msg)
         self.fetch_thread.stop()
         self.fetch_thread.wait()
         # 儀器仍在內部記錄，停用自動停止，保留手動中斷按鈕。
@@ -1737,6 +1772,7 @@ class BT2152App(QMainWindow):
         QMessageBox.warning(self, "擷取中斷", msg + "\n儀器仍在內部記錄；如需停止，請按「中斷測試」或手動處理儀器。")
 
     def stop_test(self, manual=False):
+        log.info("停止測試 manual=%s unconfirmed=%s", manual, self._inst_unconfirmed)
         retry_unconfirmed = manual and self._inst_unconfirmed
         self._stopping = True
         self.progress_timer.stop()
@@ -1794,6 +1830,7 @@ class BT2152App(QMainWindow):
                     self.lbl_conn_status.setText(f"● 已連線{suffix}")
                     self.lbl_conn_status.setStyleSheet("color: #4db06e; font-weight: bold; padding-left: 10px;")
             except Exception as e:
+                log.exception("ABORt 失敗，儀器狀態未確認")
                 self._inst_unconfirmed = True
                 self._close_csv_file()
                 self.btn_detect.setEnabled(False)
@@ -2040,6 +2077,7 @@ if __name__ == "__main__":
         _selftest_fetch_alignment()
         sys.exit(0)
 
+    _setup_logging()
     app = QApplication(sys.argv)
     window = BT2152App()
     window.show()
