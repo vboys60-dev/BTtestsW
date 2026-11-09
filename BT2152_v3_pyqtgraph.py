@@ -295,6 +295,9 @@ class FetchThread(QThread):
         self._stop_event = threading.Event()
         self.current_offset = 0
         self._error_streak = 0
+        self._temp_error_streak = 0
+        self._fatal_error = False
+        self._csv_error = False
 
         self.time_data = time_data
         self.v_data = v_data
@@ -334,19 +337,23 @@ class FetchThread(QThread):
         try:
             pts_str = self.inst.query("FETC:TEMP:LOG:POIN?").strip()
             available = int(pts_str) if pts_str else 0
-        except Exception:
+            temp_to_read = min(points_to_read, available - self.current_offset)
+            values = []
+            if temp_to_read > 0:
+                temp_str = self.inst.query(f"FETC:TEMP:LOG? {temp_to_read}, {self.current_offset}").strip().split(',')
+                # 9.91E37 代表外部感測器未接
+                values = [None if float(v) > SENTINEL_THRESHOLD else float(v) for v in temp_str[:temp_to_read]]
+            self._temp_error_streak = 0
+            return values
+        except Exception as e:
+            self._temp_error_streak += 1
+            self.error_signal.emit(f"溫度擷取錯誤（連續 {self._temp_error_streak} 次；本批補 NaN）: {e}")
             return []
-
-        temp_to_read = min(points_to_read, available - self.current_offset)
-        if temp_to_read <= 0:
-            return []
-
-        temp_str = self.inst.query(f"FETC:TEMP:LOG? {temp_to_read}, {self.current_offset}").strip().split(',')
-        # 9.91E37 代表外部感測器未接
-        return [None if float(v) > SENTINEL_THRESHOLD else float(v) for v in temp_str[:temp_to_read]]
 
     def _fetch_once(self):
         """撈一批資料並寫出。回傳 True 表示這輪有進度（可能還有欠的點，可立刻再撈下一批）。"""
+        if self._fatal_error or self._csv_error:
+            return False
         pts_str = self.inst.query("FETC:VOLT:LOG:POIN?").strip()
         if not pts_str:
             return False
@@ -358,41 +365,58 @@ class FetchThread(QThread):
         points_to_read = min(remaining, self._max_points_per_batch())
         expected = points_to_read * len(self.active_channels)
 
-        # 三個 query 都在寫入之前完成；任何一個失敗都不會留下半筆資料
+        # 電壓／電流 query 在寫入之前完成；溫度失敗則獨立警告並補 NaN。
         v_vals = self._fetch_log("FETC:VOLT:LOG?", points_to_read, expected) if self.fetch_v else []
         i_vals = [v * 1e6 for v in self._fetch_log("FETC:CURR:LOG?", points_to_read, expected)] if self.fetch_i else []
         temp_vals = self._fetch_new_temperatures(points_to_read) if self.fetch_temp else []
 
         rows = []
+        for pt_idx in range(points_to_read):
+            # 依照擷取頻率計算時間(秒)
+            t_s = (self.current_offset + pt_idx + 1) * self.interval
+            row_data = [f"{t_s:.1f}"]
+
+            for ch_idx, ch in enumerate(self.active_channels):
+                flat_idx = ch_idx * points_to_read + pt_idx
+                if self.fetch_v:
+                    v = v_vals[flat_idx]
+                    row_data.append("" if math.isnan(v) else f"{v:.3f}")
+                if self.fetch_i:
+                    i_val = i_vals[flat_idx]
+                    row_data.append("" if math.isnan(i_val) else f"{i_val:.3f}")
+
+            if self.fetch_temp:
+                t_val = temp_vals[pt_idx] if pt_idx < len(temp_vals) else None
+                row_data.append("" if t_val is None else f"{t_val:.2f}")
+
+            rows.append(row_data)
+
+        try:
+            for row_data in rows:
+                self.csv_writer.writerow(row_data)
+            self.csv_file.flush()
+        except (OSError, ValueError) as e:
+            # CSV 可能已寫入部分資料，不能重試同一批，否則 deque 與 CSV 都會重複。
+            self._csv_error = True
+            self._fatal_error = True
+            self.stop()
+            self.fatal_signal.emit(f"CSV 寫入失敗，已停止擷取，不再重試：{e}")
+            return False
+
+        # 整批寫入並 flush 成功後，才讓圖表看見這批資料。
         with self.data_lock:
             for pt_idx in range(points_to_read):
-                # 依照擷取頻率計算時間(秒)
-                t_s = (self.current_offset + pt_idx + 1) * self.interval
-                self.time_data.append(t_s)
-                row_data = [f"{t_s:.1f}"]
-
+                self.time_data.append((self.current_offset + pt_idx + 1) * self.interval)
                 for ch_idx, ch in enumerate(self.active_channels):
                     flat_idx = ch_idx * points_to_read + pt_idx
                     if self.fetch_v:
-                        v = v_vals[flat_idx]
-                        self.v_data[ch].append(v)
-                        row_data.append("" if math.isnan(v) else f"{v:.3f}")
+                        self.v_data[ch].append(v_vals[flat_idx])
                     if self.fetch_i:
-                        i_val = i_vals[flat_idx]
-                        self.i_data[ch].append(i_val)
-                        row_data.append("" if math.isnan(i_val) else f"{i_val:.3f}")
-
+                        self.i_data[ch].append(i_vals[flat_idx])
                 if self.fetch_temp:
-                    # 每個 pt_idx 都必須 append，拿不到值就補 NaN，維持 len(temp_data) == len(time_data)
+                    # 溫度不足補 NaN，維持各 deque 長度一致。
                     t_val = temp_vals[pt_idx] if pt_idx < len(temp_vals) else None
                     self.temp_data.append(float('nan') if t_val is None else t_val)
-                    row_data.append("" if t_val is None else f"{t_val:.2f}")
-
-                rows.append(row_data)
-
-        for row_data in rows:
-            self.csv_writer.writerow(row_data)
-        self.csv_file.flush()
 
         if self.fetch_temp and temp_vals:
             last_valid = temp_vals[-1]
@@ -409,12 +433,15 @@ class FetchThread(QThread):
             try:
                 # 有進度就不睡，直接撈下一批，讓分批上限不會拖慢追平積欠點數的速度
                 progressed = self._fetch_once()
+                if self._fatal_error:
+                    return
                 self._error_streak = 0
             except Exception as e:
                 progressed = False
                 self._error_streak += 1
                 self.error_signal.emit(f"擷取資料錯誤({self._error_streak}/{MAX_ERROR_STREAK}): {str(e)}")
                 if self._error_streak >= MAX_ERROR_STREAK:
+                    self._fatal_error = True
                     self.is_running = False
                     self.fatal_signal.emit(f"連續 {MAX_ERROR_STREAK} 次擷取失敗，已停止擷取：{str(e)}")
                     return
@@ -655,6 +682,9 @@ class BT2152App(QMainWindow):
 
         self.csv_file = None
         self.csv_writer = None
+        self._stopping = True  # 停止後維持，直到下一次開始測試。
+        self._connected_addr = None
+        self.fetched_v = self.fetched_i = self.fetched_temp = False
 
         self.setup_ui()
 
@@ -1032,25 +1062,29 @@ class BT2152App(QMainWindow):
     def connect_inst(self):
         try:
             want_sim = self.chk_sim_mode.isChecked()
+            address = self.io_addr_input.currentText()
             if not want_sim and self.rm is None:
                 raise RuntimeError("VISA 資源管理員無法初始化，請確認 VISA 後端；仍可使用模擬模式。")
-            # 勾選狀態與現有連線型別不一致就重建，否則模擬→真機切換要重啟程式才生效。
+            # 連線型別或真機位址改變時重建連線。
             # 測試進行中（btn_stop 可按）不動連線，避免把 FetchThread 正在用的 session 抽掉。
             if (self.inst is not None
-                    and want_sim != isinstance(self.inst, MockInstrument)
+                    and (want_sim != isinstance(self.inst, MockInstrument)
+                         or (not want_sim and address != self._connected_addr))
                     and not self.btn_stop.isEnabled()):
                 try:
                     self.inst.close()
                 except Exception:
                     pass
                 self.inst = None
+                self._connected_addr = None
 
             if self.inst is None:
                 if want_sim:
                     self.inst = MockInstrument()
                 else:
-                    self.inst = self.rm.open_resource(self.io_addr_input.currentText())
+                    self.inst = self.rm.open_resource(address)
                     self.inst.timeout = 10000
+                    self._connected_addr = address
             status_suffix = "（模擬模式）" if isinstance(self.inst, MockInstrument) else ""
             self.lbl_conn_status.setText(f"● 已連線{status_suffix}")
             self.lbl_conn_status.setStyleSheet("color: #4db06e; font-weight: bold; padding-left: 10px;")
@@ -1480,14 +1514,19 @@ class BT2152App(QMainWindow):
             self.test_duration = None
 
         # 手冊：<time> 單位為分鐘，最大測試時長 = tint × 24 小時。
-        # 留空（不限制）時直接取該上限，而不是原本硬編的 720 分鐘 —— 否則使用者設 24:00:00
-        # 時儀器會在第 12 小時自行停止，GUI 進度條卻照跑，後半段完全沒有資料。
+        # 留空時使用儀器上限，並明確提示；超過上限的指定時長直接拒絕。
         max_test_minutes = interval * 24 * 60
+        limit_text = f"{interval * 24}:00:00（{interval * 24} 小時）"
         if self.test_duration:
-            test_minutes = min(math.ceil(self.test_duration / 60), max_test_minutes)
+            if self.test_duration > max_test_minutes * 60:
+                QMessageBox.warning(self, "超過儀器時長上限", f"目前間隔 {interval} 秒，測試時長上限為 {limit_text}。")
+                return
+            test_minutes = math.ceil(self.test_duration / 60)
         else:
             test_minutes = max_test_minutes
+            QMessageBox.information(self, "儀器時長上限", f"未指定總時間；目前間隔 {interval} 秒，儀器最多記錄 {limit_text}，屆時會自行停止記錄。GUI 不偵測儀器自停，請手動中斷測試。")
 
+        self._stopping = False
         self.btn_detect.setEnabled(False)
         self.btn_cal.setEnabled(False)
         self.btn_start.setEnabled(False)
@@ -1517,7 +1556,10 @@ class BT2152App(QMainWindow):
 
         self.reset_zoom()  # 開始測試時預設自動對齊
 
-        fetch_temp = self.chk_temp.isChecked()
+        self.fetched_v = self.chk_v.isChecked()
+        self.fetched_i = self.chk_i.isChecked()
+        self.fetched_temp = self.chk_temp.isChecked()
+        fetch_temp = self.fetched_temp
 
         # CSV 先開：路徑不可寫時儀器還沒開始量測，直接退回即可，不會留下「儀器在跑但沒有
         # fetch_thread」的死狀態。檔案在測試期間保持開啟，避免每筆資料都重新開關（長測可達數十萬筆）。
@@ -1529,15 +1571,21 @@ class BT2152App(QMainWindow):
             self.stop_test()
             return
 
-        self.csv_writer = csv.writer(self.csv_file)
-        header = ["Time(s)"]
-        for ch in self.active_channels:
-            if self.chk_v.isChecked(): header.append(f"CH{ch}_V")
-            if self.chk_i.isChecked(): header.append(f"CH{ch}_uA")
-        if fetch_temp:
-            header.append("Temp_C")
-        self.csv_writer.writerow(header)
-        self.csv_file.flush()
+        try:
+            self.csv_writer = csv.writer(self.csv_file)
+            header = ["Time(s)"]
+            for ch in self.active_channels:
+                if self.fetched_v: header.append(f"CH{ch}_V")
+                if self.fetched_i: header.append(f"CH{ch}_uA")
+            if fetch_temp:
+                header.append("Temp_C")
+            self.csv_writer.writerow(header)
+            self.csv_file.flush()
+        except (OSError, ValueError) as e:
+            self._close_csv_file(warn=False)  # 關檔錯誤併入表頭失敗提示。
+            self.stop_test()
+            QMessageBox.critical(self, "CSV 表頭寫入失敗", f"{filepath}\n{e}")
+            return
 
         active_str = ",".join(map(str, self.active_channels))
         try:
@@ -1550,16 +1598,13 @@ class BT2152App(QMainWindow):
             if not err.lstrip('+').startswith("0"):
                 raise RuntimeError(f"儀器拒絕測試指令：{err}")
         except Exception as e:
-            self.csv_file.close()
-            self.csv_file = None
-            self.csv_writer = None
             QMessageBox.critical(self, "啟動失敗", str(e))
             self.stop_test()
             return
 
         self.fetch_thread = FetchThread(
             self.inst, self.active_channels, interval,
-            self.chk_v.isChecked(), self.chk_i.isChecked(), fetch_temp,
+            self.fetched_v, self.fetched_i, fetch_temp,
             self.csv_writer, self.csv_file, self.data_lock,
             self.time_data, self.v_data, self.i_data, self.temp_data
         )
@@ -1587,9 +1632,9 @@ class BT2152App(QMainWindow):
         自動決定要不要跟著新資料重新縮放（使用者一手動縮放，autorange 就會被
         pyqtgraph 自動關閉），所以這裡完全不需要手動判斷/還原縮放視野。
         """
-        show_v = self.plot_chk_v.isChecked()
-        show_i = self.plot_chk_i.isChecked()
-        show_temp = self.plot_chk_temp.isChecked()
+        show_v = self.plot_chk_v.isChecked() and self.fetched_v
+        show_i = self.plot_chk_i.isChecked() and self.fetched_i
+        show_temp = self.plot_chk_temp.isChecked() and self.fetched_temp
 
         # 只繪製「已啟用 且 使用者勾選要顯示於圖表」的通道；不影響資料記錄/CSV (仍以 active_channels 為準)
         target_channels = [ch for ch in self.active_channels if self.channel_display.get(ch, True)]
@@ -1659,14 +1704,16 @@ class BT2152App(QMainWindow):
             if self.pinned_markers:
                 self._render_marker_panel()
 
-    def _close_csv_file(self):
-        if self.csv_file is not None:
+    def _close_csv_file(self, warn=True):
+        csv_file = self.csv_file
+        self.csv_file = None
+        self.csv_writer = None
+        if csv_file is not None:
             try:
-                self.csv_file.close()
-            except:
-                pass
-            self.csv_file = None
-            self.csv_writer = None
+                csv_file.close()
+            except (OSError, ValueError) as e:
+                if warn:
+                    QMessageBox.warning(self, "CSV 關閉失敗", f"資料可能未完整儲存：\n{e}")
 
     def on_fetch_error(self, msg):
         # 原本只 print 到 stdout，用 .command 啟動時根本沒人看得到
@@ -1675,6 +1722,8 @@ class BT2152App(QMainWindow):
         self.lbl_conn_status.setStyleSheet("color: #d1a04a; font-weight: bold; padding-left: 10px;")
 
     def on_fetch_fatal(self, msg):
+        if self._stopping or not self.btn_stop.isEnabled():
+            return
         print(msg)
         self.fetch_thread.stop()
         self.fetch_thread.wait()
@@ -1686,11 +1735,28 @@ class BT2152App(QMainWindow):
         QMessageBox.warning(self, "擷取中斷", msg + "\n儀器仍在內部記錄；如需停止，請按「中斷測試」或手動處理儀器。")
 
     def stop_test(self):
+        self._stopping = True
         self.progress_timer.stop()
 
         if hasattr(self, 'fetch_thread'):
             self.fetch_thread.stop()
             self.fetch_thread.wait()
+            # wait 後才可從 UI 執行緒使用同一個 VISA session；必須在 ABORt 前補抓。
+            # 檔案身分避免啟動失敗時誤用上一輪的 fetch_thread。
+            if (self.csv_file is not None
+                    and self.fetch_thread.csv_file is self.csv_file
+                    and not self.fetch_thread._fatal_error
+                    and not self.fetch_thread._csv_error):
+                try:
+                    for _ in range(1024):
+                        if not self.fetch_thread._fetch_once():
+                            if self.fetch_thread._csv_error:
+                                raise OSError("CSV 寫入失敗，補抓資料可能未完整儲存。")
+                            break
+                    else:
+                        QMessageBox.warning(self, "停止補抓未完成", "已達 1024 批補抓上限，可能仍有未擷取資料。")
+                except Exception as e:
+                    QMessageBox.warning(self, "停止補抓失敗", f"最後資料可能未完整擷取：\n{e}")
 
         if self.inst is not None:
             try:
@@ -1842,6 +1908,68 @@ def _selftest_fetch_alignment():
     assert t._fetch_once() is True
     check_invariant(t, t.current_offset)
     assert t.current_offset > 0
+
+    # (5) CSV 在部分寫入或 flush 時失敗：立即 fatal，不得再次查詢／寫入同批。
+    class _FailingSink:
+        def __init__(self, exc_type, fail_flush):
+            self.calls = 0
+            self.exc_type = exc_type
+            self.fail_flush = fail_flush
+
+        def writerow(self, row):
+            self.calls += 1
+            if not self.fail_flush and self.calls == 2:
+                raise self.exc_type("selftest CSV 寫入失敗")
+
+        def flush(self):
+            if self.fail_flush:
+                raise self.exc_type("selftest CSV flush 失敗")
+
+    for exc_type in (OSError, ValueError):
+        for fail_flush in (False, True):
+            t = make_thread(_LaggingTempInst(), [1, 2])
+            sink = _FailingSink(exc_type, fail_flush)
+            t.csv_writer = t.csv_file = sink
+            fatals, errors = [], []
+            t.fatal_signal.connect(fatals.append)
+            t.error_signal.connect(errors.append)
+            t.run()
+            assert len(fatals) == 1 and "CSV" in fatals[0], fatals
+            assert not errors, errors
+            assert t._fatal_error and t._csv_error and not t.is_running
+            check_invariant(t, 0)
+            assert t.current_offset == 0
+            calls = sink.calls
+            class _NoQueryInst:
+                def query(self, cmd):
+                    raise AssertionError("CSV fatal 後不得重抓")
+            t.inst = _NoQueryInst()
+            assert t._fetch_once() is False
+            assert sink.calls == calls
+            check_invariant(t, 0)
+
+    # (6) 溫度點數／資料查詢失敗只警告，電壓／電流繼續且不觸發 fatal。
+    class _FailingTempInst(_LaggingTempInst):
+        def __init__(self, fail_points):
+            self.fail_points = fail_points
+
+        def query(self, cmd):
+            failing_cmd = "FETC:TEMP:LOG:POIN?" if self.fail_points else "FETC:TEMP:LOG?"
+            if cmd.startswith(failing_cmd):
+                raise OSError("selftest 溫度查詢失敗")
+            return super().query(cmd)
+
+    for fail_points in (True, False):
+        t = make_thread(_FailingTempInst(fail_points), [1, 2])
+        errors, fatals = [], []
+        t.error_signal.connect(errors.append)
+        t.fatal_signal.connect(fatals.append)
+        assert t._fetch_once() is True
+        check_invariant(t, 3)
+        assert all(math.isnan(v) for v in t.temp_data)
+        assert len(errors) == 1 and not fatals
+        assert t._temp_error_streak == 1 and t._error_streak == 0
+        assert t.current_offset == 3 and not t._fatal_error
 
     print("_selftest_fetch_alignment 全部通過")
 
