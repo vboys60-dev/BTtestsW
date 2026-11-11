@@ -201,18 +201,40 @@ class _PollingThread(QThread):
         已開始執行，直接輪詢會讀到上一輪殘留的 1，於是 FETC 取回的是上一輪的舊資料。
         手冊建議用 *OPC? 同步，但 *OPC? 會一路阻塞到操作完成（in situ 校準約 2 分鐘，遠超過
         inst.timeout=10 秒），而且阻塞期間無法取消，closeEvent 就收不掉這個執行緒。
-        等 AVAI? 歸零則不阻塞、可取消，最壞情況（settle_s 內沒讀到 0）也只是退回原本的行為。"""
-        settle_deadline = time.time() + settle_s
-        while not self._cancelled and time.time() < settle_deadline:
+        等 AVAI? 歸零期間維持可取消；settle_s 內沒讀到 0 則查錯並拋例外，禁止取回舊資料。
+        此受理判斷未經真機驗證。"""
+        settled = False
+        settle_deadline = time.monotonic() + settle_s
+        while not self._cancelled and time.monotonic() < settle_deadline:
             if int(self.inst.query(query)) == 0:
+                settled = True
                 break
             time.sleep(0.2)
 
-        deadline = time.time() + timeout_s
+        if self._cancelled:
+            return False
+        if not settled:  # 未經真機驗證：未見 0 時不可把殘留的 1 當作本輪完成。
+            err = self.inst.query("SYST:ERR?").strip()
+            if self._cancelled:
+                return False
+            try:
+                error_code = int(err.split(',', 1)[0])
+            except ValueError:
+                raise RuntimeError(f"等待 {query} 歸零失敗，無法判讀 SYST:ERR?：{err}")
+            if error_code != 0:
+                raise RuntimeError(f"儀器拒絕指令（{query} 未歸零）：{err}")
+            raise RuntimeError(
+                f"等待 {query} 歸零逾時（{settle_s} 秒），SYST:ERR? 無錯誤（{err}）；"
+                "儀器未受理指令或狀態不明，停止以避免讀取上一輪舊資料")
+
+        deadline = time.monotonic() + timeout_s
         while not self._cancelled:
-            if int(self.inst.query(query)) == 1:
+            available = int(self.inst.query(query))
+            if self._cancelled:
+                return False
+            if available == 1:
                 return True
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
                 raise TimeoutError(f"等待 {query} 逾時（{timeout_s} 秒），請檢查儀器狀態或保護事件")
             time.sleep(1)
         return False
@@ -227,6 +249,7 @@ class OcvThread(_PollingThread):
 
     def run(self):
         try:
+            self.inst.write("*CLS")  # 清舊錯誤，避免 _wait_available 的 SYST:ERR? 誤報（未經真機驗證）
             self.inst.write("INIT:TEST:OCV 4.5, 0.5, 0.01, 1, (@1:32)")
             if not self._wait_available("SENS:OCV:AVAI?", OCV_WAIT_TIMEOUT_S):
                 return
@@ -267,6 +290,7 @@ class InSituThread(_PollingThread):
                 
             active_str = ",".join(map(str, self.active_channels))
             
+            self.inst.write("*CLS")  # 同 OCV：先清舊錯誤（未經真機驗證）
             self.inst.write(f"CONF:INS:CURR {self.cal_level}")
             self.inst.write(f"CAL:WIRE:RES:INS (@{active_str})")
             if not self._wait_available("SENS:WIRE:RES:AVAI?", INSITU_WAIT_TIMEOUT_S):
@@ -1986,6 +2010,101 @@ class BT2152App(QMainWindow):
         self._force_close = True
         self.close()
 
+def _selftest_wait_available():
+    """#9 的假儀器自檢；AVAI? 受理判斷未經真機驗證。"""
+    query = "SENS:OCV:AVAI?"
+
+    class _StubInst:
+        def __init__(self, values, error='+0,"No error"', cancel_at=None, cancel_on_err=False):
+            self.cancel_on_err = cancel_on_err
+            self.values = iter(values)
+            self.error = error
+            self.cancel_at = cancel_at
+            self.polls = 0
+            self.commands = []
+            self.thread = None
+
+        def query(self, cmd):
+            self.commands.append(cmd)
+            if cmd == "SYST:ERR?":
+                if self.cancel_on_err:
+                    self.thread.stop()
+                return self.error
+            assert cmd == query, cmd
+            self.polls += 1
+            if self.polls == self.cancel_at:
+                self.thread.stop()
+            return next(self.values, "1")
+
+    def make_thread(inst):
+        inst.thread = _PollingThread(inst)
+        return inst.thread
+
+    # 殘留的 1 必須先歸零，再等本輪完成。
+    inst = _StubInst(["1", "1", "0", "1"])
+    assert make_thread(inst)._wait_available(query, 1, settle_s=1) is True
+    assert inst.polls == 4 and "SYST:ERR?" not in inst.commands
+
+    # 永遠為 1：不論 error queue 是否有錯，都必須拋例外。
+    for error, message in (('+0,"No error"', "儀器未受理指令或狀態不明"),
+                           ('-200,"Execution error"', "儀器拒絕指令")):
+        inst = _StubInst([], error=error)
+        try:
+            make_thread(inst)._wait_available(query, 1, settle_s=0.01)
+        except RuntimeError as exc:
+            assert message in str(exc) and error in str(exc), str(exc)
+        else:
+            raise AssertionError("AVAI? 永遠為 1 時不得成功")
+        assert inst.commands[-1] == "SYST:ERR?"
+        assert inst.commands.count("SYST:ERR?") == 1
+
+    # settle 與完成輪詢期間取消，均回 False，且不查錯。
+    for values, cancel_at in ((["1"], 1), (["0", "1"], 2)):
+        inst = _StubInst(values, cancel_at=cancel_at)
+        assert make_thread(inst)._wait_available(query, 1, settle_s=0.1) is False
+        assert "SYST:ERR?" not in inst.commands
+
+    # SYST:ERR? 格式認不得：拋例外。
+    inst = _StubInst([], error="garbage")
+    try:
+        make_thread(inst)._wait_available(query, 1, settle_s=0.01)
+    except RuntimeError as exc:
+        assert "無法判讀" in str(exc), str(exc)
+    else:
+        raise AssertionError("SYST:ERR? 無法判讀時不得成功")
+
+    # 查錯期間被取消：回 False，不拋例外。
+    inst = _StubInst([], error='-200,"x"', cancel_on_err=True)
+    assert make_thread(inst)._wait_available(query, 1, settle_s=0.01) is False
+
+    print("_selftest_wait_available 全部通過")
+
+
+def _selftest_fetch_completed():
+    """#11：停止中或停止按鈕停用時忽略完成訊號；正常停止成功才提示。"""
+    from unittest.mock import Mock, patch
+
+    for stopping, enabled in ((True, True), (True, False), (False, False), (False, True)):
+        gui = Mock()
+        gui._stopping = stopping
+        gui.btn_stop.isEnabled.return_value = enabled
+        with patch.object(QMessageBox, "information") as information:
+            BT2152App.on_fetch_completed(gui)
+            if stopping or not enabled:
+                gui.stop_test.assert_not_called()
+            else:
+                gui.stop_test.assert_called_once()
+                on_done = gui.stop_test.call_args.kwargs["on_done"]
+                on_done(False)
+                information.assert_not_called()
+                on_done(True)
+                information.assert_called_once_with(
+                    gui, "測試完成", "儀器已達記錄上限，自動停止")
+            if stopping or not enabled:
+                information.assert_not_called()
+    print("_selftest_fetch_completed 全部通過")
+
+
 def _selftest_fetch_alignment():
     """FetchThread 取樣管線的不變式檢查，執行方式：
 
@@ -2163,6 +2282,7 @@ def _selftest_fetch_alignment():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _app = QApplication(sys.argv)     # QThread 物件需要 QApplication
+        _selftest_wait_available()
         _selftest_fetch_alignment()
         sys.exit(0)
 

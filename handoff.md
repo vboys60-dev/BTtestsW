@@ -144,6 +144,7 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
 
 - **第 3 批（需真機確認語意）**：
   - #9 settle 階段可能把上一輪殘留的 `AVAI?`=1 當成功 → 先加 `SYST:ERR?` 檢查，再確認 AVAI 實際行為。
+    - **工作區已改、未 commit、待真機**：settle 未見 0 → 查 `SYST:ERR?` 並 raise；INIT 前加 `*CLS`；假儀器自檢已接入 `--selftest`。風險：若真機 INIT 後 `AVAI?` 不一定先讀到 0（量測極快或 INIT 不清 AVAI），OCV/In Situ 會誤判失敗。真機請錄 `AVAI?` 讀值序列確認；不成立則改 `*OPC` + `*ESR?` 輪詢。
   - #10 校準結果未驗證（筆數、9.91E37 sentinel、合理範圍）就 `SAVE 1` 並放行測試；電阻上限需依手冊或實測定。
   - #6 確認 `ABORt` 前後 log 是否仍可讀（目前補抓放在 ABORt 之前）。
   - C 的策略（fatal 不送 ABORt）建議和真機使用者確認。
