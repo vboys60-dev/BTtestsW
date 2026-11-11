@@ -332,14 +332,21 @@ def _nan_if_sentinel(val):
     return float('nan') if val > SENTINEL_THRESHOLD else val
 
 
+def _expected_total_points(test_minutes, interval):
+    """依送給儀器的分鐘數估算點數；首點是否為 t=0 仍待真機確認。"""
+    return math.ceil(test_minutes * 60 / interval)
+
+
 class FetchThread(QThread):
     update_signal = pyqtSignal()
+    completed_signal = pyqtSignal()  # #11 未經真機驗證：預期點數已全數寫入。
     error_signal = pyqtSignal(str)
     fatal_signal = pyqtSignal(str)
     temp_signal = pyqtSignal(float)
 
     def __init__(self, inst, active_channels, interval, fetch_v, fetch_i, fetch_temp,
-                 csv_writer, csv_file, data_lock, time_data, v_data, i_data, temp_data):
+                 csv_writer, csv_file, data_lock, time_data, v_data, i_data, temp_data,
+                 expected_total_points=None):
         super().__init__()
         self.inst = inst
         self.active_channels = active_channels
@@ -353,6 +360,7 @@ class FetchThread(QThread):
         self.is_running = True
         self._stop_event = threading.Event()
         self.current_offset = 0
+        self.expected_total_points = expected_total_points
         self._error_streak = 0
         self._temp_error_streak = 0
         self._fatal_error = False
@@ -414,11 +422,17 @@ class FetchThread(QThread):
         """撈一批資料並寫出。回傳 True 表示這輪有進度（可能還有欠的點，可立刻再撈下一批）。"""
         if self._csv_error or (self._fatal_error and not allow_comm_fatal):
             return False
+        # #11 未經真機驗證：自停後 POIN? 行為未知；達上限後不再查詢或補抓。
+        if (self.expected_total_points is not None
+                and self.current_offset >= self.expected_total_points):
+            return False
         pts_str = self.inst.query("FETC:VOLT:LOG:POIN?").strip()
         if not pts_str:
             return False
 
         remaining = int(pts_str) - self.current_offset
+        if self.expected_total_points is not None:
+            remaining = min(remaining, self.expected_total_points - self.current_offset)
         if remaining <= 0:
             return False
 
@@ -496,6 +510,12 @@ class FetchThread(QThread):
                 if self._fatal_error:
                     return
                 self._error_streak = 0
+                # #11 未經真機驗證：offset 只在 CSV flush 與 deque 寫入成功後推進。
+                if (self.is_running and self.expected_total_points is not None
+                        and self.current_offset >= self.expected_total_points):
+                    self.stop()
+                    self.completed_signal.emit()
+                    return
             except Exception as e:
                 progressed = False
                 self._error_streak += 1
@@ -1643,7 +1663,15 @@ class BT2152App(QMainWindow):
             test_minutes = math.ceil(self.test_duration / 60)
         else:
             test_minutes = max_test_minutes
-            QMessageBox.information(self, "儀器時長上限", f"未指定總時間；目前間隔 {interval} 秒，儀器最多記錄 {limit_text}，屆時會自行停止記錄。GUI 不偵測儀器自停，請手動中斷測試。")
+
+        # #11 未經真機驗證：<time> 為分鐘；自停後 POIN? 是否保留總點數待確認。
+        expected_total_points = _expected_total_points(test_minutes, interval)
+        if self.test_duration is None:
+            QMessageBox.information(
+                self, "儀器時長上限",
+                f"未指定總時間；目前間隔 {interval} 秒，儀器最多記錄 {limit_text}。"
+                f"預期取得 {expected_total_points} 點後自動停止；"
+                "若儀器點數不足未自動停止，請手動中斷。")
 
         self._stopping = False
         self.btn_detect.setEnabled(False)
@@ -1719,9 +1747,10 @@ class BT2152App(QMainWindow):
                 raise RuntimeError(f"儀器拒絕測試指令：{err}")
 
         self.btn_stop.setEnabled(False)  # INIT 送出期間不可中斷；成功後才開放
-        self._run_io(job, lambda r, e: self._on_test_started(e, interval, filepath, fetch_temp))
+        self._run_io(job, lambda r, e: self._on_test_started(
+            e, interval, filepath, fetch_temp, expected_total_points))
 
-    def _on_test_started(self, exc, interval, filepath, fetch_temp):
+    def _on_test_started(self, exc, interval, filepath, fetch_temp, expected_total_points):
         if exc is not None:
             QMessageBox.critical(self, "啟動失敗", str(exc))
             self.stop_test()
@@ -1731,11 +1760,13 @@ class BT2152App(QMainWindow):
             self.inst, self.active_channels, interval,
             self.fetched_v, self.fetched_i, fetch_temp,
             self.csv_writer, self.csv_file, self.data_lock,
-            self.time_data, self.v_data, self.i_data, self.temp_data
+            self.time_data, self.v_data, self.i_data, self.temp_data,
+            expected_total_points=expected_total_points
         )
         self.fetch_thread.update_signal.connect(lambda: self.update_plot(force_redraw=False))
         self.fetch_thread.error_signal.connect(self.on_fetch_error)
         self.fetch_thread.fatal_signal.connect(self.on_fetch_fatal)
+        self.fetch_thread.completed_signal.connect(self.on_fetch_completed)
         self.fetch_thread.temp_signal.connect(self.on_temp_update)
         self.fetch_thread.start()
         log.info("測試開始 通道數=%d csv=%s", len(self.active_channels), filepath)
@@ -1845,6 +1876,13 @@ class BT2152App(QMainWindow):
         log.warning("擷取錯誤: %s", msg)
         self.lbl_conn_status.setText(f"● {msg}")
         self.lbl_conn_status.setStyleSheet("color: #d1a04a; font-weight: bold; padding-left: 10px;")
+
+    def on_fetch_completed(self):
+        # #11 未經真機驗證：沿用總紀錄時間到期的正常停止路徑，成功後才提示。
+        if self._stopping or not self.btn_stop.isEnabled():
+            return
+        self.stop_test(on_done=lambda ok: ok and QMessageBox.information(
+            self, "測試完成", "儀器已達記錄上限，自動停止"))
 
     def on_fetch_fatal(self, msg):
         if self._stopping or not self.btn_stop.isEnabled():
@@ -2113,19 +2151,22 @@ def _selftest_fetch_alignment():
     不變式：len(time_data) == len(v_data[ch]) == len(i_data[ch]) == len(temp_data)。
     一旦破壞，update_plot() 會永久丟 "X and Y arrays must be the same shape"，且無法恢復。
     """
+    assert _expected_total_points(5 * 24 * 60, 5) == 86400
+    assert _expected_total_points(1, 7) == 9
 
     class _NullSink:
         def writerow(self, row): pass
         def flush(self): pass
 
-    def make_thread(inst, channels, fetch_temp=True):
+    def make_thread(inst, channels, fetch_temp=True, expected_total_points=None):
         sink = _NullSink()
         time_data, temp_data = deque(), deque()
         v_data = {i: deque() for i in range(1, 33)}
         i_data = {i: deque() for i in range(1, 33)}
         t = FetchThread(inst, channels, 5, True, True, fetch_temp,
                         sink, sink, threading.Lock(),
-                        time_data, v_data, i_data, temp_data)
+                        time_data, v_data, i_data, temp_data,
+                        expected_total_points=expected_total_points)
         return t
 
     def check_invariant(t, expected_len):
@@ -2183,6 +2224,74 @@ def _selftest_fetch_alignment():
     assert math.isnan(t.temp_data[1]) and math.isnan(t.temp_data[2])
     assert t.current_offset == 3
 
+    # #11 未經真機驗證：假儀器 3 點已寫入後自行結束；None 仍等待新資料。
+    for total in (3, None):
+        t = make_thread(_LaggingTempInst(), [1, 2], expected_total_points=total)
+        completed, fatals = [], []
+        t.completed_signal.connect(lambda: completed.append(t.current_offset))
+        t.fatal_signal.connect(fatals.append)
+        t.start()
+        try:
+            if total is None:
+                assert not t.wait(100), "未指定上限時不得自行結束"
+            else:
+                assert t.wait(2000), "達預期點數後應自行結束"
+        finally:
+            t.stop()
+            assert t.wait(2000), "selftest 執行緒未結束"
+        QApplication.processEvents()
+        check_invariant(t, 3)
+        assert t.current_offset == 3 and not fatals and not t._fatal_error
+        assert completed == ([3] if total == 3 else []), completed
+
+    # 每輪只新增 1 點：完成訊號須在 offset 恰等於 expected 時發出一次。
+    # 同步 run 讓 slot 當下記錄 offset，避免 queued signal 掩蓋提早完成。
+    class _IncrementingInst:
+        def __init__(self):
+            self.points = 0
+            self.offsets = []
+
+        def query(self, cmd):
+            if cmd == "FETC:VOLT:LOG:POIN?":
+                assert not completed, completed
+                self.offsets.append(t.current_offset)
+                self.points += 1
+                assert self.points <= 3, "達預期點數後不得繼續查詢"
+                return str(self.points)
+            if cmd.startswith("FETC:VOLT:LOG?"):
+                return "3.7,3.7"  # 2 通道 × 1 點
+            if cmd.startswith("FETC:CURR:LOG?"):
+                return "1e-6,1e-6"
+            raise AssertionError(cmd)
+
+    inst = _IncrementingInst()
+    t = make_thread(inst, [1, 2], fetch_temp=False, expected_total_points=3)
+    completed, fatals = [], []
+    t.completed_signal.connect(lambda: completed.append(t.current_offset))
+    t.fatal_signal.connect(fatals.append)
+    t.run()
+    assert completed == [3], completed  # expected-1 變異會在 offset=2 發出而失敗。
+    assert inst.offsets == [0, 1, 2], inst.offsets
+    assert t.current_offset == 3 and not t.is_running and not fatals
+    check_invariant(t, 3)
+
+    # 即使 POIN? 超出預期，上限仍為 3；達上限後連停止補抓也不得再 query。
+    class _OverLimitInst(_LaggingTempInst):
+        def query(self, cmd):
+            if cmd == "FETC:VOLT:LOG:POIN?":
+                return "8"
+            return super().query(cmd)
+
+    t = make_thread(_OverLimitInst(), [1, 2], expected_total_points=3)
+    assert t._fetch_once() is True
+    check_invariant(t, 3)
+    class _NoQueryAfterLimit:
+        def query(self, cmd):
+            raise AssertionError("達預期點數後不得再查詢")
+    t.inst = _NoQueryAfterLimit()
+    assert t._fetch_once() is False
+    assert t.current_offset == 3
+
     # (3) 分批上限：一次請求的值不得超過 8192
     requested = []
 
@@ -2232,15 +2341,16 @@ def _selftest_fetch_alignment():
 
     for exc_type in (OSError, ValueError):
         for fail_flush in (False, True):
-            t = make_thread(_LaggingTempInst(), [1, 2])
+            t = make_thread(_LaggingTempInst(), [1, 2], expected_total_points=3)
             sink = _FailingSink(exc_type, fail_flush)
             t.csv_writer = t.csv_file = sink
-            fatals, errors = [], []
+            fatals, errors, completed = [], [], []
             t.fatal_signal.connect(fatals.append)
             t.error_signal.connect(errors.append)
+            t.completed_signal.connect(lambda: completed.append(True))
             t.run()
             assert len(fatals) == 1 and "CSV" in fatals[0], fatals
-            assert not errors, errors
+            assert not errors and not completed, (errors, completed)
             assert t._fatal_error and t._csv_error and not t.is_running
             check_invariant(t, 0)
             assert t.current_offset == 0
@@ -2283,6 +2393,7 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _app = QApplication(sys.argv)     # QThread 物件需要 QApplication
         _selftest_wait_available()
+        _selftest_fetch_completed()
         _selftest_fetch_alignment()
         sys.exit(0)
 

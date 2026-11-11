@@ -149,6 +149,7 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
   - #6 確認 `ABORt` 前後 log 是否仍可讀（目前補抓放在 ABORt 之前）。
   - C 的策略（fatal 不送 ABORt）建議和真機使用者確認。
   - #11 偵測「儀器已自停」（不限時長時儀器於 tint×24h 自停，GUI 計時照跑）。
+    - **工作區已改、未 commit、待真機**：依 `expected_total_points` 收齊資料後發出完成訊號，走正常停止流程；提示列出預期點數與不足時手動中斷，自檢涵蓋逐點遞增、完成訊號恰好一次、點數公式與 GUI 守門。真機待確認：(a) 自停後 `FETC:*:LOG:POIN?` 的值；(b) 第一點時間為 `t=interval` 還是 `t=0`，若 `t=0` 多記一點則公式需 +1，否則最後 1 點會被截掉（與 #6／時間軸同一問題）；(c) `POIN?` 少報時不會自動停止，需手動中斷。
 - **第 4 批（#13 已完成，`c3edb99`＋`83d5549`，未真機驗證）**：連線／`INIT:TEST:MATC`＋`SYST:ERR?`／停止（等擷取執行緒＋補抓＋ABORt＋重建 session）全改由 `_IoTask`（QThread）執行，`_run_io(fn, on_done)` 派工、`_io_busy` 旗標防重入（忙碌中 `start_ocv/start_in_situ/start_test/stop_test` 直接 return，`closeEvent` 提示稍後再關）。`stop_test(manual, on_done)` 改非同步，結果以 `on_done(ok)` 回報；`closeEvent` 改為 ignore → 停止完成後 `_on_close_stopped` 再 `close()`。**規則**：`_run_io` 的 fn 在背景跑，不可碰 widget／彈窗（警告收集成 notes 由主執行緒顯示），且作業期間 `self.inst` 由該作業獨占。殘留：`closeEvent` 內 `thread.wait(5000)` 與最後的 `inst.close()` 仍在 GUI 執行緒。
   - **Codex 整檔複審（2026-11-09，4 輪，最終 APPROVED）**：已修三項——連線重建失敗且 `inst` 為 None 時清空 `active_channels`、停用校準/開始、表格設 X；停止期間發生的 CSV fatal 會被 `on_fetch_fatal` 忽略，改由 `stop_test` 的 job 在 `wait()` 後補報（`FetchThread._fatal_notified` 記錄 GUI 是否已提示，補抓例外已涵蓋時不重複）；`closeEvent` 確認對話框（巢狀事件迴圈）之後再檢查 `_io_busy`。
   - **複審中提出但刻意不修**：settle 階段殘留 `AVAI?`=1（即 #9）、校準結果未驗證就 `SAVE 1`（即 #10）——兩者仍待真機；`closeEvent` 的 `wait`／`inst.close()` 阻塞 GUI（已知殘留）；追平積欠資料時每批都發更新訊號、重複重繪（等實際卡頓再做 dirty flag＋固定頻率重繪）。
