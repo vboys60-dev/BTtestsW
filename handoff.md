@@ -58,7 +58,7 @@ v1/v2 沒有這個收合功能，不受影響、未同步修。
 - `FetchThread` 輪詢最快4秒（UI interval最小值5秒換算）。總紀錄時間設得比輪詢週期短，可能還沒拿到資料點就自動停止——預期行為非bug。
 - 標記資訊 overlay 沒有滾動/裁切，同時顯示通道太多（如30+）文字方塊會很長蓋住圖表。因應：引導使用者取消勾選不需要的通道。
 - v1/v2 沒有今天(v3)新增的任何功能、精簡、Dark Mode、收合bugfix，三檔案功能集不同步。
-- 以下 SCPI 功能有意不做（YAGNI，等有實際需求再接）：`CONF:TEST:WIRE:RESistance` 沒送過，導線電阻永遠停在預設 5Ω range，>5Ω 的場合無法切到 10/20Ω；`STATus:ALARm:*` 與 `OUTPut:PROTection:CLEar` 未使用，OVP/UVP/OCP 保護事件只能在前面板手動清除；`INIT:TEST:MATC` 的保護參數只抽成常數，沒有 GUI 入口。
+- 以下 SCPI 功能有意不做（YAGNI，等有實際需求再接）：`CONF:TEST:WIRE:RESistance` 未送，range 推測為預設 5Ω，待真機以 `CONF:TEST:WIRE:RES?` 確認，>5Ω 的場合無法切到 10/20Ω；`STATus:ALARm:*` 與 `OUTPut:PROTection:CLEar` 未使用，OVP/UVP/OCP 保護事件只能在前面板手動清除；`INIT:TEST:MATC` 的保護參數只抽成常數，沒有 GUI 入口。
 
 ## 驗證方式
 
@@ -144,12 +144,23 @@ python3 probe_bt2152.py --addr TCPIP0::169.254.4.61::inst0::INSTR
 
 - **第 3 批（需真機確認語意）**：
   - #9 settle 階段可能把上一輪殘留的 `AVAI?`=1 當成功 → 先加 `SYST:ERR?` 檢查，再確認 AVAI 實際行為。
-    - **工作區已改、未 commit、待真機**：settle 未見 0 → 查 `SYST:ERR?` 並 raise；INIT 前加 `*CLS`；假儀器自檢已接入 `--selftest`。風險：若真機 INIT 後 `AVAI?` 不一定先讀到 0（量測極快或 INIT 不清 AVAI），OCV/In Situ 會誤判失敗。真機請錄 `AVAI?` 讀值序列確認；不成立則改 `*OPC` + `*ESR?` 輪詢。
+    - **已 commit `0f6aae1`、待真機**（Opus 審查通過，附真機風險）：settle 未見 0 → 查 `SYST:ERR?` 並 raise；INIT 前加 `*CLS`；假儀器自檢已接入 `--selftest`。風險：若真機 INIT 後 `AVAI?` 不一定先讀到 0（量測極快或 INIT 不清 AVAI），OCV/In Situ 會誤判失敗。真機請錄 `AVAI?` 讀值序列確認；不成立則改 `*OPC` + `*ESR?` 輪詢。
   - #10 校準結果未驗證（筆數、9.91E37 sentinel、合理範圍）就 `SAVE 1` 並放行測試；電阻上限需依手冊或實測定。
+    - **已實作並 commit（Opus 審查通過，未經真機驗證）**：`_validate_wire_res` 在 `SAVE 1` 前檢查筆數、float 解析、sentinel、有限值及 `0.001 <= R <= 5Ω`。失敗保留通道、原始值與處置指引，並提示「儀器揮發性導線電阻值可能已被本次校準改寫且未存檔，須重新校準成功後才能測試」。
+    - **決定記錄（未經真機驗證）**：
+      - P1：與 Opus 原建議 `0 <= R` 相反，下限改為 **0.001Ω**。依原廠 MATLAB 範例（`R>5||R<0.001` 判異常；`BT2152B-prg.md` 第 1355 行），此為 GUI 驗收門檻；低於下限提示「0 為開機/CLEar 預設值，無法確認校準有效」。
+      - P2：與 Opus 原建議失敗後 `LOAD 1` 相反，**不送 LOAD 1/CLEar，改用 `_cal_valid` 守門**。`LOAD 1` 載入的是檔案 1 舊值，非本輪校準前值的還原；`CLEar` 全通道歸零也擋不了測試。初始、重新 OCV、重新校準與所有連線重建（含 `_abort_inst` 重開 session）均撤銷有效性，僅校準成功回呼設為有效。
+      - P3：維持 **5Ω 常數**，註解引用手冊第 1019 行「導線電阻須在 0~5Ω」；僅補超限訊息：儀器 range 可能非 5Ω 或接線/接觸不良，請檢查指定通道後重新 OCV 偵測→校準；本 GUI 不支援 >5Ω。
+      - 守門漏洞已修：`_on_stopped` 原本只看 `active_channels`，校準失敗後中斷成功可能重新啟用測試。兩處啟用 `btn_start` 均要求通道非空、`_cal_valid`、非 `_inst_unconfirmed`；`start_test` 在 CSV 覆寫詢問之前同樣檢查並提示先校準。
+      - 新增 `SYST:ERR?` helper：解析逗號前整數、遇 0 停止、最多讀 10 次，保留非零錯誤原文，無法解析則 raise。保留 INIT 前 `*CLS`；VAL? 驗證後、SAVE 前有「本輪儀器錯誤」就不 SAVE、不放行；SAVE 後有非零錯誤仍視為校準成功，但提示「校準完成，但存檔到記憶體 1 失敗：<err>」。通訊或解析例外沿用失敗路徑。
+      - P6／自檢已補：每案期望值、真實 SCPI 科學記號（含空格與換行）、0.001 成功／0.000999 失敗／0 失敗、MockInstrument 0.05~0.25Ω 與 `SYST:ERR?` 回 0、本輪 error queue 非零不 SAVE、不放行、SAVE 後報錯成功但警告、解析／通訊例外、校準失敗後中斷成功仍鎖定、守門條件與連線重建撤銷校準。
+    - **驗證（未經真機驗證）**：使用啟動腳本同一 Anaconda 環境執行 `QT_QPA_PLATFORM=offscreen python3 BT2152_v3_pyqtgraph.py --selftest`，四組自檢全部通過；`git diff --check` 通過。
+    - **真機待確認（以上均未經真機驗證）**：`CONF:TEST:WIRE:RES?` 是否回 5，以及是否要校準前固定 range；校準失敗後 `VAL?` 的實際值；完成後 `SYST:ERR?` 是否會有無關錯誤造成誤判失敗；`VAL?` 實際回傳格式。
+    - **刻意不做（未經真機驗證）**：LOAD 1/CLEar、可調或動態上限、校準前送或查 range、P4（失敗時全通道標 Error 的既有行為不改）、P5（sentinel/isfinite 檢查冗餘不改）。
   - #6 確認 `ABORt` 前後 log 是否仍可讀（目前補抓放在 ABORt 之前）。
   - C 的策略（fatal 不送 ABORt）建議和真機使用者確認。
   - #11 偵測「儀器已自停」（不限時長時儀器於 tint×24h 自停，GUI 計時照跑）。
-    - **工作區已改、未 commit、待真機**：依 `expected_total_points` 收齊資料後發出完成訊號，走正常停止流程；提示列出預期點數與不足時手動中斷，自檢涵蓋逐點遞增、完成訊號恰好一次、點數公式與 GUI 守門。真機待確認：(a) 自停後 `FETC:*:LOG:POIN?` 的值；(b) 第一點時間為 `t=interval` 還是 `t=0`，若 `t=0` 多記一點則公式需 +1，否則最後 1 點會被截掉（與 #6／時間軸同一問題）；(c) `POIN?` 少報時不會自動停止，需手動中斷。
+    - **已 commit `5a557bd`、待真機**（Opus 審查通過，低嚴重度項已修）：依 `expected_total_points` 收齊資料後發出完成訊號，走正常停止流程；提示列出預期點數與不足時手動中斷，自檢涵蓋逐點遞增、完成訊號恰好一次、點數公式與 GUI 守門。真機待確認：(a) 自停後 `FETC:*:LOG:POIN?` 的值；(b) 第一點時間為 `t=interval` 還是 `t=0`，若 `t=0` 多記一點則公式需 +1，否則最後 1 點會被截掉（與 #6／時間軸同一問題）；(c) `POIN?` 少報時不會自動停止，需手動中斷。
 - **第 4 批（#13 已完成，`c3edb99`＋`83d5549`，未真機驗證）**：連線／`INIT:TEST:MATC`＋`SYST:ERR?`／停止（等擷取執行緒＋補抓＋ABORt＋重建 session）全改由 `_IoTask`（QThread）執行，`_run_io(fn, on_done)` 派工、`_io_busy` 旗標防重入（忙碌中 `start_ocv/start_in_situ/start_test/stop_test` 直接 return，`closeEvent` 提示稍後再關）。`stop_test(manual, on_done)` 改非同步，結果以 `on_done(ok)` 回報；`closeEvent` 改為 ignore → 停止完成後 `_on_close_stopped` 再 `close()`。**規則**：`_run_io` 的 fn 在背景跑，不可碰 widget／彈窗（警告收集成 notes 由主執行緒顯示），且作業期間 `self.inst` 由該作業獨占。殘留：`closeEvent` 內 `thread.wait(5000)` 與最後的 `inst.close()` 仍在 GUI 執行緒。
   - **Codex 整檔複審（2026-11-09，4 輪，最終 APPROVED）**：已修三項——連線重建失敗且 `inst` 為 None 時清空 `active_channels`、停用校準/開始、表格設 X；停止期間發生的 CSV fatal 會被 `on_fetch_fatal` 忽略，改由 `stop_test` 的 job 在 `wait()` 後補報（`FetchThread._fatal_notified` 記錄 GUI 是否已提示，補抓例外已涵蓋時不重複）；`closeEvent` 確認對話框（巢狀事件迴圈）之後再檢查 `_io_busy`。
   - **複審中提出但刻意不修**：settle 階段殘留 `AVAI?`=1（即 #9）、校準結果未驗證就 `SAVE 1`（即 #10）——兩者仍待真機；`closeEvent` 的 `wait`／`inst.close()` 阻塞 GUI（已知殘留）；追平積欠資料時每批都發更新訊號、重複重繪（等實際卡頓再做 dirty flag＋固定頻率重繪）。

@@ -297,12 +297,21 @@ class InSituThread(_PollingThread):
                 return
 
             res_data = self.inst.query(f"CAL:WIRE:RES:VAL? (@{active_str})").strip().split(',')
+            # #10 未經真機驗證：全部通道通過驗證後才可存檔、回報成功。
+            res_data = _validate_wire_res(res_data, self.active_channels, WIRE_RES_MAX_OHM)
+            # #10 未經真機驗證：本輪有儀器錯誤不存檔；存檔錯誤不否定已驗證的工作值。
+            errors = _read_instrument_errors(self.inst)
+            if errors:
+                raise RuntimeError("本輪儀器錯誤：" + "; ".join(errors))
             self.inst.write("CAL:WIRE:RES:SAVE 1")
-            
-            self.finished_signal.emit(True, "In Situ 校準完成，並已存入記憶體 1。", res_data)
+            errors = _read_instrument_errors(self.inst)
+            msg = ("校準完成，但存檔到記憶體 1 失敗：" + "; ".join(errors) if errors
+                   else "In Situ 校準完成，並已存入記憶體 1。")
+            self.finished_signal.emit(True, msg, res_data)
             
         except Exception as e:
-            self.finished_signal.emit(False, f"校準執行錯誤: {str(e)}", [])
+            # #10 未經真機驗證：失敗後工作值可能已改寫，必須重新校準。
+            self.finished_signal.emit(False, f"校準執行錯誤: {e}。{WIRE_RES_FAILURE_NOTE}", [])
 
 # ==========================================
 # 背景執行緒 3：用於定時從內部記憶體撈取測試資料
@@ -310,6 +319,52 @@ class InSituThread(_PollingThread):
 # 儀器以 +9.91E37 表示「此筆無效」：外部感測器未接、通道觸發 OVP/UVP 保護、電池被拔除等。
 # 直接收進繪圖資料會把 Y 軸 autorange 拉到 1e37，其他曲線全被壓平。
 SENTINEL_THRESHOLD = 1e30
+WIRE_RES_MAX_OHM = 5.0  # #10 未經真機驗證：手冊（BT2152B-prg.md 第 1019 行）導線電阻須在 0~5Ω
+# #10 未經真機驗證：共用驗證失敗提示，避免誤以為未 SAVE 就未改寫工作值。
+WIRE_RES_FAILURE_NOTE = "儀器揮發性導線電阻值可能已被本次校準改寫且未存檔，須重新校準成功後才能測試"
+
+
+def _read_instrument_errors(inst):
+    """#10 未經真機驗證：最多讀 10 次 SYST:ERR?，遇 0 停止並回傳非零錯誤原文。"""
+    errors = []
+    for _ in range(10):
+        err = inst.query("SYST:ERR?").strip()
+        try:
+            error_code = int(err.split(',', 1)[0])
+        except ValueError:
+            raise RuntimeError(f"無法判讀 SYST:ERR?：{err}") from None
+        if error_code == 0:
+            break
+        errors.append(err)
+    return errors
+
+
+def _validate_wire_res(res_data, channels, max_ohm):
+    """#10 未經真機驗證：回傳有效導線電阻；錯誤保留通道與原始值供排查。"""
+    # 未經真機驗證：下限依原廠 MATLAB 範例（R>5||R<0.001 判異常），屬 GUI 驗收門檻。
+    if len(res_data) != len(channels):
+        raise ValueError(
+            f"導線電阻筆數不符：通道 {list(channels)} 預期 {len(channels)} 筆，"
+            f"收到 {len(res_data)} 筆，原始值={res_data!r}")
+    values = []
+    for ch, raw in zip(channels, res_data):
+        context = f"通道 {ch} 導線電阻原始值={raw!r}"
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{context}：無法解析為數字") from None
+        if not math.isfinite(value):
+            raise ValueError(f"{context}：必須為有限值且 0.001 <= R <= {max_ohm} Ω")
+        if value > SENTINEL_THRESHOLD:
+            raise ValueError(f"{context}：無效值 sentinel")
+        if value < 0.001:
+            raise ValueError(f"{context}：低於 0.001Ω；0 為開機/CLEar 預設值，無法確認校準有效")
+        if value > max_ohm:
+            raise ValueError(
+                f"{context}：儀器 range 可能非 5Ω 或接線/接觸不良；"
+                f"請檢查通道 {ch} 後重新 OCV 偵測→校準；本 GUI 不支援 >5Ω")
+        values.append(value)
+    return values
 
 # INIT:TEST:MATChed 的保護參數，目前未做成 GUI 選項（手冊範圍註記於後，日後接 UI 從這裡改）
 TEST_OVP_V = 4.3        # 過電壓保護，手冊 0.5~4.5 V
@@ -741,6 +796,7 @@ class BT2152App(QMainWindow):
         except Exception:
             self.rm = None
         self.inst = None
+        self._cal_valid = False  # #10 未經真機驗證：僅本次連線校準成功後可測試。
         self._inst_unconfirmed = False  # ABORt 失敗後，完成回呼也不得解鎖操作。
         self.active_channels = []
 
@@ -1185,6 +1241,7 @@ class BT2152App(QMainWindow):
         if (self.inst is not None and may_rebuild
                 and (want_sim != isinstance(self.inst, MockInstrument)
                      or (not want_sim and address != self._connected_addr))):
+            self._cal_valid = False  # #10 未經真機驗證：重建前先撤銷校準有效性。
             try:
                 self.inst.close()
             except Exception:
@@ -1193,6 +1250,7 @@ class BT2152App(QMainWindow):
             self._connected_addr = None
         if self.inst is not None:
             return False
+        self._cal_valid = False  # #10 未經真機驗證：新 session 不沿用舊校準。
         if want_sim:
             self.inst = MockInstrument()
         else:
@@ -1520,6 +1578,8 @@ class BT2152App(QMainWindow):
         except:
             QMessageBox.warning(self, "警告", "OCV 最低電壓必須介於 2.8V 至 4.3V 之間")
             return
+        self._cal_valid = False  # #10 未經真機驗證：重新偵測須重新校準。
+        self.btn_start.setEnabled(False)
         want_sim = self.chk_sim_mode.isChecked()
         address = self.io_addr_input.currentText()
         may_rebuild = not self.btn_stop.isEnabled()  # 測試進行中不抽掉 FetchThread 的 session
@@ -1574,6 +1634,7 @@ class BT2152App(QMainWindow):
     # --- 2. In Situ 校準 ---
     def start_in_situ(self):
         if self._io_busy: return
+        self._cal_valid = False  # #10 未經真機驗證：本輪成功前禁止測試。
         self.btn_detect.setEnabled(False)
         self.btn_cal.setEnabled(False)
         self.btn_start.setEnabled(False)
@@ -1586,6 +1647,7 @@ class BT2152App(QMainWindow):
         self.insitu_thread.start()
 
     def on_insitu_finished(self, success, msg, res_data):
+        self._cal_valid = success  # #10 未經真機驗證：存檔警告仍保留有效工作值。
         self.btn_detect.setEnabled(not self._inst_unconfirmed)
         self.btn_cal.setEnabled(not self._inst_unconfirmed)
         if success:
@@ -1601,8 +1663,12 @@ class BT2152App(QMainWindow):
                 self.table.setItem(ch-1, 3, QTableWidgetItem(text))
 
 
-            QMessageBox.information(self, "完成", msg)
-            self.btn_start.setEnabled(not self._inst_unconfirmed)
+            if msg.startswith("校準完成，但存檔到記憶體 1 失敗："):
+                QMessageBox.warning(self, "存檔失敗", msg)
+            else:
+                QMessageBox.information(self, "完成", msg)
+            # #10 未經真機驗證：啟用條件與停止回呼、start_test 守門一致。
+            self.btn_start.setEnabled(bool(self.active_channels) and self._cal_valid and not self._inst_unconfirmed)
         else:
             for ch in self.active_channels:
                 self.table.setItem(ch-1, 3, QTableWidgetItem("Error"))
@@ -1611,6 +1677,10 @@ class BT2152App(QMainWindow):
     # --- 3. 開始測試 ---
     def start_test(self):
         if self._io_busy: return
+        # #10 未經真機驗證：CSV 覆寫詢問前先檢查，避免程式呼叫繞過按鈕。
+        if not (self.active_channels and self._cal_valid and not self._inst_unconfirmed):
+            QMessageBox.warning(self, "警告", "請先完成 OCV 偵測並重新校準成功，確認儀器狀態後才能測試。")
+            return
         if hasattr(self, 'insitu_thread') and self.insitu_thread.isRunning():
             QMessageBox.warning(self, "警告", "校準仍在執行中，請等校準結束後再開始測試。")
             return
@@ -1950,6 +2020,7 @@ class BT2152App(QMainWindow):
                 raise
             # 僅未確認狀態的手動重試可重建；此時擷取執行緒已停止。
             # 沿用原 session 的模式／記錄位址，不採用 UI 中途變更的設定。
+            self._cal_valid = False  # #10 未經真機驗證：含重開 session 失敗也撤銷校準。
             want_sim = isinstance(self.inst, MockInstrument)
             try:
                 self.inst.close()
@@ -1991,7 +2062,8 @@ class BT2152App(QMainWindow):
         self._close_csv_file()
         self.btn_detect.setEnabled(True)
         if self.active_channels: self.btn_cal.setEnabled(True)
-        if self.active_channels: self.btn_start.setEnabled(True)
+        # #10 未經真機驗證：中斷成功不得放行失敗或舊 session 的校準。
+        self.btn_start.setEnabled(bool(self.active_channels) and self._cal_valid and not self._inst_unconfirmed)
         self.btn_stop.setEnabled(False)
         if on_done: on_done(True)
 
@@ -2047,6 +2119,191 @@ class BT2152App(QMainWindow):
                     QMessageBox.warning(self, "關閉連線失敗", str(e))
         self._force_close = True
         self.close()
+
+def _selftest_wire_res():
+    """#10 未經真機驗證：假儀器確認驗值、error queue、存檔與 GUI 守門。"""
+    from unittest.mock import Mock, patch
+
+    channels = [2, 7]
+
+    class _StubInst(MockInstrument):
+        def __init__(self, response, errors=()):
+            super().__init__()
+            self.response = response
+            self.writes = []
+            self.available = iter(["0", "1"])
+            self.errors = iter(errors)
+            self.error_reads = []
+
+        def write(self, cmd):
+            self.writes.append(cmd)
+            super().write(cmd)
+
+        def query(self, cmd):
+            if cmd == "SENS:WIRE:RES:AVAI?":
+                return next(self.available)
+            if cmd.startswith("CAL:WIRE:RES:VAL?") and self.response is not None:
+                return self.response
+            if cmd == "SYST:ERR?":
+                err = next(self.errors, super().query(cmd))
+                self.error_reads.append(err)
+                if isinstance(err, Exception):
+                    raise err
+                return err
+            return super().query(cmd)
+
+    # 未經真機驗證：每案帶期望值；None 表示檢查 MockInstrument 的產值範圍。
+    cases = [(None, True, None, None), ("0.05,5.0", True, [0.05, 5.0], None),
+             ("+5.000000E-02, +1.000000E-01\n", True, [0.05, 0.1], None),
+             ("0.05,0.001", True, [0.05, 0.001], None),
+             ("0.05", False, [], "筆數不符"),
+             ("0.05,0.1,0.2", False, [], "筆數不符")]
+    for raw in ("9.91E37", "0", "-0.1", "0.000999", "5.01", "garbage", "nan", "inf", "+inf", "-inf", ""):
+        cases.append((f"0.05,{raw}", False, [], raw))
+
+    for response, expected, expected_values, detail in cases:
+        inst = _StubInst(response)
+        thread = InSituThread(inst, channels, "0.1")
+        results = []
+        thread.finished_signal.connect(lambda *args: results.append(args))
+        thread.run()
+        assert len(results) == 1, results
+        success, msg, values = results[0]
+        assert success is expected, results
+        assert inst.writes.count("CAL:WIRE:RES:SAVE 1") == int(expected), inst.writes
+        if expected:
+            if expected_values is None:  # 保留 MockInstrument 的校準產值與回傳格式。
+                assert len(values) == len(channels) and all(0.05 <= v <= 0.25 for v in values), values
+            else:
+                assert values == expected_values, values
+            assert inst.error_reads == ['+0,"No error"', '+0,"No error"'], inst.error_reads
+        else:
+            assert values == expected_values and detail in msg and "原始值" in msg, results
+            assert WIRE_RES_FAILURE_NOTE in msg, msg
+            assert (str(channels) if detail == "筆數不符" else "通道 7") in msg, msg
+            if detail in ("0", "-0.1", "0.000999"):
+                assert "0 為開機/CLEar 預設值，無法確認校準有效" in msg, msg
+            if detail == "5.01":
+                assert "請檢查通道 7 後重新 OCV 偵測→校準；本 GUI 不支援 >5Ω" in msg, msg
+            if detail == "+inf":
+                assert "必須為有限值" in msg and "sentinel" not in msg, msg
+            if detail == "9.91E37":
+                assert "無效值 sentinel" in msg and "必須為有限值" not in msg, msg
+            assert not inst.error_reads, inst.error_reads
+            gui = Mock()
+            gui._cal_valid = True  # 失敗回呼也須撤銷先前有效狀態。
+            gui._inst_unconfirmed = False
+            gui.active_channels = channels
+            with patch.object(QMessageBox, "warning"):
+                BT2152App.on_insitu_finished(gui, success, msg, values)
+            assert gui._cal_valid is False
+            gui.btn_start.setEnabled.assert_not_called()
+            # 未經真機驗證：校準失敗後，中斷成功仍不得啟用測試。
+            BT2152App._on_stopped(gui, None, [], False, None)
+            gui.btn_start.setEnabled.assert_called_once_with(False)
+
+    # 未經真機驗證：數值合法但本輪有錯不 SAVE；SAVE 後有錯仍成功並警告。
+    error = '-222,"Data out of range"'
+    error2 = '-200,"Execution error"'
+    for errors, expected, saves, detail in (
+            ([error, error2, '0,"No error"'], False, 0, "本輪儀器錯誤"),
+            (['0,"No error"', error, '0,"No error"'], True, 1, "校準完成，但存檔到記憶體 1 失敗："),
+            (["garbage"], False, 0, "無法判讀 SYST:ERR?"),
+            (['0,"No error"', "garbage"], False, 1, "無法判讀 SYST:ERR?"),
+            (['0,"No error"', OSError("通訊失敗")], False, 1, "通訊失敗")):
+        inst = _StubInst("0.05,0.1", errors)
+        thread = InSituThread(inst, channels, "0.1")
+        results = []
+        thread.finished_signal.connect(lambda *args: results.append(args))
+        thread.run()
+        assert len(results) == 1, results
+        success, msg, values = results[0]
+        assert success is expected and detail in msg, results
+        assert values == ([0.05, 0.1] if expected else []), results
+        assert inst.writes.count("CAL:WIRE:RES:SAVE 1") == saves, inst.writes
+        assert len(inst.error_reads) == len(errors), inst.error_reads
+        if error in errors:
+            assert error in msg, msg
+        if error2 in errors:
+            assert error2 in msg, msg
+        gui = Mock()
+        gui.active_channels = channels
+        gui._inst_unconfirmed = False
+        with patch.object(QMessageBox, "information") as information, patch.object(QMessageBox, "warning") as warning:
+            BT2152App.on_insitu_finished(gui, success, msg, values)
+        if expected:
+            warning.assert_called_once_with(gui, "存檔失敗", msg)
+            information.assert_not_called()
+        assert gui._cal_valid is expected
+        BT2152App._on_stopped(gui, None, [], False, None)
+        gui.btn_start.setEnabled.assert_called_with(expected)
+
+    # 未經真機驗證：錯誤讀取有上限；完整檢查兩處按鈕與 start_test 的相同守門條件。
+    inst = _StubInst("0.05,0.1", [error] * 11)
+    assert _read_instrument_errors(inst) == [error] * 10
+    assert len(inst.error_reads) == 10
+    for active in ([], channels):
+        for cal_valid in (False, True):
+            for unconfirmed in (False, True):
+                gui = Mock()
+                gui.active_channels = active
+                gui._cal_valid = cal_valid
+                gui._inst_unconfirmed = unconfirmed
+                allowed = bool(active) and cal_valid and not unconfirmed
+                BT2152App._on_stopped(gui, None, [], False, None)
+                # 停止成功會解除 unconfirmed，但仍須通道與有效校準。
+                gui.btn_start.setEnabled.assert_called_once_with(bool(active) and cal_valid)
+                gui._inst_unconfirmed = unconfirmed
+                with patch.object(QMessageBox, "information"):
+                    BT2152App.on_insitu_finished(gui, True, "完成", [0.05, 0.1])
+                gui.btn_start.setEnabled.assert_called_with(bool(active) and not unconfirmed)
+                gui._cal_valid = cal_valid
+                gui._io_busy = False
+                gui.insitu_thread.isRunning.return_value = False
+                gui.filepath_input.text.return_value = ""
+                if not allowed:
+                    with patch.object(QMessageBox, "warning") as warning, patch.object(QMessageBox, "question") as question:
+                        BT2152App.start_test(gui)
+                    warning.assert_called_once()
+                    assert "重新校準成功" in warning.call_args.args[2], warning.call_args
+                    question.assert_not_called()
+                    gui.filepath_input.text.assert_not_called()
+
+    # OCV 輸入無效時保留既有校準與測試按鈕狀態。
+    for min_v in ("garbage", "2.7", "4.4"):
+        gui = Mock()
+        gui._io_busy = False
+        gui._cal_valid = True
+        gui.min_ocv_input.text.return_value = min_v
+        with patch.object(QMessageBox, "warning"):
+            BT2152App.start_ocv(gui)
+        assert gui._cal_valid is True
+        gui.btn_start.setEnabled.assert_not_called()
+        gui._run_io.assert_not_called()
+
+    # 未經真機驗證：重建成功／失敗，以及 ABORt 重開 session，均撤銷舊校準。
+    for fail in (False, True):
+        gui = Mock()
+        gui._cal_valid = True
+        gui.inst = MockInstrument()
+        gui.rm.open_resource.side_effect = OSError("連線失敗") if fail else None
+        try:
+            BT2152App._connect_blocking(gui, False, "test-address", True)
+        except OSError:
+            assert fail
+        assert gui._cal_valid is False
+        gui = Mock()
+        gui._cal_valid = True
+        gui.inst.write.side_effect = OSError("中斷失敗")
+        gui.rm.open_resource.side_effect = OSError("連線失敗") if fail else None
+        try:
+            BT2152App._abort_inst(gui, True)
+        except RuntimeError:
+            assert fail
+        assert gui._cal_valid is False
+
+    print("_selftest_wire_res 全部通過")
+
 
 def _selftest_wait_available():
     """#9 的假儀器自檢；AVAI? 受理判斷未經真機驗證。"""
@@ -2392,6 +2649,7 @@ def _selftest_fetch_alignment():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _app = QApplication(sys.argv)     # QThread 物件需要 QApplication
+        _selftest_wire_res()
         _selftest_wait_available()
         _selftest_fetch_completed()
         _selftest_fetch_alignment()
